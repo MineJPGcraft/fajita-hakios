@@ -1,0 +1,33 @@
+diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
+index 63ffd4b..9542ce4 100644
+--- a/xnu/files/osfmk/arm64/gic_v3_irq.c
++++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
+@@ -72,7 +72,9 @@
+ 
+ #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
+ #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
+-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
++#define GIC_INTID_VTIMER_DEFAULT 27         /* EL1 virtual timer PPI on QEMU virt and ARM reference systems */
++static uint32_t gic_intid_vtimer = GIC_INTID_VTIMER_DEFAULT;
++#define GIC_INTID_VTIMER        gic_intid_vtimer
+ #define GIC_INTID_SPI_MIN       32
+ #define GIC_INTID_SPURIOUS_MIN  1020
+ #define GIC_SPI_MOST            48          /* attached at a time */
+@@ -418,7 +420,16 @@ gic_v3_irq_cpu_init(void)
+ {
+ 	int cpu = cpu_number();
+ 	vm_offset_t gicr;
+-	uint32_t mine = 1u << GIC_INTID_VTIMER;
++	uint32_t mine;
++
++	if (cpu == 0) {
++		uint32_t intid;
++
++		if (PE_parse_boot_argn("vtimer_intid", &intid, sizeof(intid)) && intid >= 16 && intid < GIC_INTID_SPI_MIN) {
++			gic_intid_vtimer = intid;
++		}
++	}
++	mine = 1u << GIC_INTID_VTIMER;
+ 
+ 	if (gicd_base == 0) {
+ 		DTEntry entry;

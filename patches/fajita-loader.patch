@@ -1,0 +1,57 @@
+diff --git a/xnuloader/loader.c b/xnuloader/loader.c
+index 422f9d3..c287c84 100644
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -561,6 +561,7 @@ struct platform {
+ 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
+ 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
+ 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
++	uint32_t vtimer_intid;           /* EL1 virtual timer PPI when the SoC differs from the ARM default */
+ };
+ 
+ static const struct platform platform_qemu_virt = {
+@@ -588,6 +589,16 @@ static const struct platform platform_redwood = {
+ 	.small_cores = 0x0f,
+ };
+ 
++static const struct platform platform_fajita = {
++	/* OnePlus 6T (fajita), SDM845; addresses from edk2-porting/edk2-sdm845. */
++	.name = "fajita", .io_base = 0x00400000, .io_size = 0x3FC00000,
++	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 0,
++	.cores = 8, .core_shift = 8,
++	/* Kryo 385: cores 0-3 are Silver, cores 4-7 are Gold. */
++	.small_cores = 0x0f,
++	.vtimer_intid = 19,              /* observed on the SDM845 dipper port; verify on fajita */
++};
++
+ /* ------------------------------------------------------------------------ */
+ 
+ static void
+@@ -3196,6 +3207,18 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	 * shortened and the kernel took it as that). Now it is said, with how much was lost.
+ 	 */
+ 	const char *rest = pi.cmdline;
++	int own_vtimer = 0;
++	for (const char *c = pi.cmdline; *c; c++) {
++		own_vtimer |= starts_with(c, "vtimer_intid=") && (c == pi.cmdline || c[-1] == ' ');
++	}
++	if (PLAT->vtimer_intid != 0 && !own_vtimer) {
++		char timer_arg[] = "vtimer_intid=00 ";
++		timer_arg[13] = (char)('0' + PLAT->vtimer_intid / 10);
++		timer_arg[14] = (char)('0' + PLAT->vtimer_intid % 10);
++		for (const char *c = timer_arg; *c && n < BOOT_LINE_LENGTH - 1; c++) {
++			ba->commandLine[n++] = *c;
++		}
++	}
+ 	for (; *rest && n < BOOT_LINE_LENGTH - 1; rest++) {
+ 		ba->commandLine[n++] = *rest;
+ 	}
+@@ -4345,6 +4368,8 @@ efi_main(efi_handle image, efi_system_table *st)
+ 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
+ 		if (SCREEN.base == 0xE1000000ULL) {
+ 			PLAT = &platform_redwood;
++		} else if (SCREEN.base == 0x9D400000ULL) {
++			PLAT = &platform_fajita;
+ 		} else {
+ 			ramfb_phone_screen();
+ 		}

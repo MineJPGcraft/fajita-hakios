@@ -1,0 +1,56 @@
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -577,6 +577,7 @@
+ 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+ 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
+ 	int no_log_write;                /* never write the log to a partition (the stock one called logdump holds Android's) */
++	int no_storage_write;            /* no UFS writes until this device's partition layout is verified */
+ 	uint32_t midr_part[2];           /* Qualcomm (0x51) core part numbers: a second way to tell this device apart, 0: unused */
+ 	uint32_t vtimer_intid;           /* the PPI of the EL1 virtual timer if it is not the kernel's default 27 (boot-arg vtimer_intid=) */
+ };
+@@ -607,10 +608,10 @@
+ 	.fb_base = 0xE1000000,
+ };
+ 
+-static const struct platform platform_dipper = {
+-	/* Xiaomi Mi 8 (SDM845). GIC, MPIDR and SMC-PSCI from the stock device tree (F-007, EXP-0001). */
+-	.name = "dipper", .io_base = 0x00400000, .io_size = 0x3FC00000,
+-	/* no log partition here, and "N s: the kernel has logged 0 bytes" lines every 2 s only cover the kernel's screen */
++static const struct platform platform_fajita = {
++	/* OnePlus 6T (fajita, SDM845). GIC and memory map from edk2-sdm845. */
++	.name = "fajita", .io_base = 0x00400000, .io_size = 0x3FC00000,
++	/* Do not write a partition until fajita's GPT is read from this phone. */
+ 	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 0,
+ 	.cores = 8, .core_shift = 8,
+ 	/* Kryo 385: cores 0-3 Silver (part 0x803, A55 class), 4-7 Gold (part 0x802, A75 class). */
+@@ -622,8 +623,9 @@
+ 	 */
+ 	.fb_base = 0x9D400000,
+ 	.midr_part = { 0x802, 0x803 },
+-	.vtimer_intid = 19,      /* measured on core 0, EXP-0028 / F-017; the kernel's default is 27 */
+-	.no_log_write = 1,       /* Mi 8 has a stock partition named logdump: the log would overwrite its first blocks */
++	.vtimer_intid = 19,      /* provisional SDM845 value from dipper; verify on fajita */
++	.no_log_write = 1,
++	.no_storage_write = 1,
+ };
+ 
+ /*
+@@ -633,7 +635,7 @@
+  */
+ static const struct platform *const platforms[] = {
+ 	&platform_redwood,
+-	&platform_dipper,
++	&platform_fajita,
+ };
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -1912,5 +1914,9 @@
+ 	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
+ 	static const char name[] = "darwin";
+ 	const char *why = NULL;
++	if (PLAT->no_storage_write) {
++		print("ufs: writes disabled for platform %s until its storage layout is verified\n", PLAT->name);
++		return 0;
++	}
+ 
+ 	for (unsigned i = 0; i < sizeof(name); i++) {

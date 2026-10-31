@@ -1,0 +1,4 @@
+# Local upstream checkouts used as porting references.
+/ref/
+/.work/
+__pycache__/
