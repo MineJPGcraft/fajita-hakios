@@ -53,3 +53,34 @@ edk2-sdm845       e1952621f419f8db60ed28271264e1b5184c571d
 - `scripts/apply-fajita-to-dipper.sh` 可在 dipper 的固定 SDM845 源码准备完成后，替换 loader 平台名、关闭未核验的 UFS 写入，并重建 ARM64 loader。
 
 当前 `devices/fajita` 是移植草案，不代表已在 OnePlus 6T 实机启动或验证。
+
+## fajita GPT/APFS 实验记录
+
+以下是本次在实机 LUN 0（4 KiB 扇区）上实际执行的 GPT 改造，不是只在文件中规划的布局。原 GPT 的末端是 LBA `30437370`，`userdata` 原本从 LBA `1601344` 延伸到末端。为了放置 HakiOS/APFS，先从 `userdata` 尾部划出 `5243387` 个扇区（约 20 GiB），再把这段空间作为新分区使用：
+
+| 分区 | 起始 LBA | 结束 LBA | 扇区数 | 类型 |
+| --- | ---: | ---: | ---: | --- |
+| `userdata`（缩容后） | `1601344` | `25193983` | `23592640` | 原 userdata GUID `1b81e7e6-f50d-419b-a739-2aeef8da3335` |
+| `darwin`（新增） | `25193984` | `30437370` | `5243387` | Apple APFS GUID `7c3457ef-0000-11aa-aa11-00306543ecac` |
+
+`darwin` 的分区 GUID 为 `47b0585a-4452-465c-9328-9abc3596e4f6`，容量为 `5243387 × 4096 = 21476913152` 字节。GPT 其它分区的起止 LBA 保持原值。生成的 Firehose 写入描述在 `.work/fajita-apfs/rawprogram0.xml`（同内容也保存在 `gpt-install.xml`）：
+
+```xml
+<program SECTOR_SIZE_IN_BYTES="4096" filename="gpt-main-new.bin"
+         label="PrimaryGPT" num_partition_sectors="6"
+         physical_partition_number="0" readbackverify="true"
+         sparse="false" start_sector="0" />
+<program SECTOR_SIZE_IN_BYTES="4096" filename="gpt-backup-new.bin"
+         label="BackupGPT" num_partition_sectors="5"
+         physical_partition_number="0" readbackverify="true"
+         sparse="false" start_sector="30437371" />
+```
+
+实际执行过程是：
+
+1. 使用 bkerler EDL 的 OnePlus `fajita` 认证流程，项目 ID 为 `18801`。Firehose 在任何 GPT/分区写操作前先发送 `setprojmodel`，设备返回认证成功；未认证时同一 GPT 写入会被拒绝。
+2. 按 Firehose 写入描述将主 GPT 写到 LBA `0..5`，其中 header 在 LBA 1、GPT 条目在 LBA `2..5`；备 GPT 条目写到 LBA `30437371..30437374`，header 写到 LBA `30437375`。
+3. 从设备分别回读主表和备表，并重新计算 GPT header CRC 和条目 CRC。主表文件与回读文件 SHA-256 都是 `dbfd90b8d299b34f64c02d3bc2495522c04ced5b8b9a2073f6f131368b98ffe2`；备表文件与回读文件 SHA-256 都是 `e32d7e977c59e72c7f0e13317dd97f8a4a390489ad8d0b890e68886b08443fcc`。主表 header CRC 为 `a784873a`，备表 header CRC 为 `12b634fd`，两边条目 CRC 均为 `ead1bfb1`，计算值与 GPT 内记录一致。
+4. 将 APFS 镜像写入 `darwin` 的起始 LBA `25193984`。写入文件 `.work/fajita-apfs/darwin-system.img` 大小为 `8365539328` 字节，SHA-256 为 `9efb156f417e32b6f92d709af33c0e8e584693c3fbd29eaf139b57eee3735560`。设备端回读首 1 MiB 和末 1 MiB，均与镜像对应区域逐字节匹配；没有做完整 8.36 GB 镜像回读。
+
+因此可以确认 GPT 已按上表写入，`darwin` 的首尾抽样也已写入。这个结论与启动结果分开：本轮没有刷写 Android `boot` 分区，也没有切换 A/B 槽位；通过 `fastboot boot` 临时启动 UEFI/XNUP 后设备仍回到 9008。当前 `boot-fajita-direct-apfs-v7.img` 已使用新的 darwin 边界，但它仍使用早期测试的 `-v cpus=1 bootcpu=0 ufs_write=0` 和 4 MiB 测试 ramdisk。参考 `ref/dipper-xnu` 的启动流程还需要验证 `ufs=2 root_apfs=ufs_darwin`、`flashboot.apfs` 和完整 payload 的分阶段传入，因此不能把 9008 归因于 GPT 写入失败。
