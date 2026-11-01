@@ -1,56 +1,75 @@
-# fajita 启动链与迁移流程审计
+# fajita 启动链与迁移审计
 
-审计范围：在手机不可启动的前提下，对项目候选镜像、`ref/dipper-xnu` 的启动实现、`ref/edk2-sdm845` 的 fajita 平台和 HakiOS 的设备移植文档做主机侧静态核对。没有执行设备操作。本审计区分源码/镜像可直接证明的事实与必须在设备上观察的未知项。
+## 当前结论（2026-11-01）
 
-## 结论
+上一版 `.work/build/fajita/boot-fajita-singlecore-no-usb.img`（SHA-256 `546689dbf549ede970c4ae55eccb80c5b137718aec3bb85f3b4913be96974fb2`）实机仍进入 9008，已停止推荐。没有完整 loader/kernel 输出，不能确认它执行到了 XNU，更不能把编译成功、UEFI logo 或主机设备名称当作 XNU 启动证据。
 
-此前反复回到 9008 的候选并非同一条完整启动链：旧 `boot-fajita-no-usb.img` 在 UEFI FD 后没有 `XNUP`，根本没有可执行的 XNU；`boot-fajita-direct-apfs-v7.img` 虽含 kernel，却只有 4 MiB `ramdisk`，没有 dipper 的 `flashboot` 启动卷，不能视为 dipper 文档中的完整 UFS 根卷启动载荷。因而此前的启动结果不能证明“USB 导致 9008”，也不能用来断言当前完整候选会失败在哪个 XNU 初始化阶段。
+本轮修改代码并构建 `.work/build/fajita/boot-fajita-ufs-no-usb.img`，修复下述三处主机侧可确认的问题。新版尚未实机测试；这些问题不能直接等同于上一版进入 9008 的唯一原因。本轮未枚举设备、未刷写、未更改 GPT，也未禁用 Qualcomm USB DXE。
 
-在 dipper 的 loader 实现中，不带 `usb` 的 payload 仍会进入 `run_kernel()`；`oneshot` 只让 loader 跳过 USB fastboot 服务后执行内嵌 kernel。当前唯一候选 `.work/candidates/fajita-singlecore-no-usb-v2/boot-fajita-singlecore-no-usb.img` 的 XNUP 结构已包含最新 `loader.efi`、`flashboot`、`kernel`、`ramdisk`、cmdline 和 `oneshot`，显式选择单核、`ufs=2 root_apfs=ufs_darwin` 和 PPI 19。从主机静态证据看，它与 dipper 的完整 UFS one-shot 路径相符；尚无该镜像的实机结果，不能宣称它已能启动。
+最终整条构建脚本返回 0；当前镜像为 12,804,096 字节，SHA-256 `03be952478163c4952eda415f2391427e5880119757bbe09f181e57b8a085670`。日志为 `.work/build/fajita/apply-ufs-bds-final.log`；重建后仍以该轮 `SHA256SUMS` 为准。
 
-## 参考仓库各自覆盖什么
+## 已修复的启动链问题
 
-`ref/dipper-xnu` 是主要参考。其 `docs/development/FIRST_INSTALL.md`、`docs/build/BUILD.md`、`docs/build/USERLAND.md`、`docs/install/STARTUP.md` 和 `tools/build/build-payload.py` 串起固定源码准备、XNU/loader/UEFI 构建、iOS 用户空间与固件准备、分区/镜像校验、临时启动和验收。该流程在小米 Mi 8（`dipper`）上有实机启动与桌面证据，但 loader、DT/身份、UFS 参数及驱动状态属于 dipper，不能直接当作 fajita 已验证流程。
+### 1. 不在 DXE 调度期间执行 loader
 
-`ref/dipper-xnu/work/edk2/Platform/Oneplus/sdm845/` 提供 fajita/enchilada 的 EDK2 平台源文件。当前 dipper 工作树对 fajita 加入了 `XnuLoaderDxe`，并将 `loader.efi` 编入 FV；`boot-fajita.img` 是 BootShim + UEFI FD 的 Android boot 镜像，不带 XNUP kernel payload。完整执行仍需要在该镜像后附上正确的 XNUP。
+旧工作树的 `XnuLoaderDxeEntry()` 在注册 BootOrder 前直接调用 `LoadImage/StartImage`。它只有 variable 架构协议依赖，没有 GOP、Block I/O 或控制器连接完成依赖。该调用会占住 DXE 调度，不保证控制台与 UFS 已就绪。
 
-`ref/hakios-xnu-kernel/docs/porting/` 给出通用设备层/SoC 层/驱动逐步移植流程；其 `devices/fajita/` 是 provisional 骨架，明确所有手机驱动仍关闭。它不是可直接启动的 fajita 内核发行物。
+已恢复 `ref/dipper-xnu/bootloader/uefi/XnuLoaderPkg/Driver/XnuLoaderDxe/` 的 BDS 路径，并把源码纳入本项目的 `devices/fajita/uefi/files/XnuLoaderPkg/Driver/`。DXE 只把 loader 放到 BootOrder 首位，不自行执行。参考平台的 `PlatformBootManagerAfterConsole()` 会连接其余设备（`EfiBootManagerConnectAll()`），然后由 BDS 执行启动选项。
 
-`ref/hakios-uefi` 描述 HakiOS 在 Mu-Silicium 上的另一种 UEFI 集成流程，包括自有 BootShim 与 Boot Manager。当前 fajita 候选实际基于 `dipper-xnu/work/edk2` 的 EDK2 `XnuLoaderDxe` 路线，不是把 `hakios-uefi` 应用后的 Mu-Silicium 镜像；不要把两种 loader 启动入口混成一条链。
+### 2. UFS 服务与 XNU 不能占用同一个核心
 
-## dipper 启动链映射
+`loader.c::run_on_other_cpu()` 才会持续执行 `block_poll()`，为 XNU 的 `redwood_ufs.c` mailbox 请求调用固件 Block I/O。同核 `jump_to_kernel()` 不会继续运行这条服务循环；内核 UFS 请求会等不到回复。
 
-1. 主机把 BootShim、SDM845 UEFI FD 和 XNUP 一起打入 Android boot v1 的 kernel 区域，gzip 后附 DTB。`mkxnuimg.py` 与 EDK2 的 `Silicon/platform.sh.inc` 定义了这个布局。
-2. BootShim 将 FD 复制到固件地址，并把 FD 后面的 XNUP 复制到 `PAYLOAD_BASE`（当前为 `0xF0000000`）。
-3. UEFI 的 `XnuLoaderDxe` 从 firmware volume 加载并启动内嵌 `loader.efi`。loader 从 `PAYLOAD_BASE` 解析 XNUP。
-4. `loader.c::run_kernel()` 要求 payload 含 Mach-O `kernel`，放置 kernel、ramdisk 和 boot args，随后按 cmdline 初始化 UFS 服务并跳入 XNU。
-5. UFS 根卷的 dipper 流程传入 `flashboot.apfs` 和第二个 payload ramdisk：前者映射为 `/dev/md0` 启动卷，后者为 `/dev/md1`；完整 iOS 系统从设备 `darwin` UFS 分区读取。主机只把两份 4 MiB APFS 启动卷放入 payload，不把完整系统塞进 XNUP。
+旧 `bootcpu=0 cpus=1 ufs=2` 在 UEFI 位于 core 0 时存在这个确定的服务缺口。当前 `devices/fajita/bootargs.txt` 为：
 
-## 候选镜像静态核验
+```text
+-v bootcpu=7 cpus=1 ufs=2 root_apfs=ufs_darwin vtimer_intid=19
+```
 
-核验方法：解析 Android boot v1 头、解压 kernel 区域、检查 `XNUP` 边界及每个 24 字节条目头，再核对条目长度和 payload 终止边界。下列结果来自当前工作区文件。
+这里 `cpus=1` 只限制 XNU 用一个核心，UEFI 仍留在原核提供 UFS 服务。`bootcpu=7` 沿用 dipper 的核间交接选择；没有启用 dipper 的其它六个 XNU 核心，也没有启用其 GPU、触控或 Wi-Fi 参数。
 
-| 镜像 | XNUP 条目 | 静态判断 |
-| --- | --- | --- |
-| `.work/artifacts/fajita/boot-fajita-no-usb.img` | 无 XNUP | 确定错误：loader 没有 kernel，不能启动 XNU。 |
-| `.work/artifacts/fajita/boot-fajita-direct-apfs-v7.img` | `kernel`, `ramdisk`, `cmdline` | 有 kernel，但没有 `flashboot`；不完整匹配 dipper 的 UFS 根卷配方。 |
-| `.work/candidates/fajita-singlecore-no-usb-v2/boot-fajita-singlecore-no-usb.img` | `loader.efi`, `flashboot`, `kernel`, `ramdisk`, `cmdline`, `oneshot` | payload 长度、XNUP 条目和末尾边界一致；没有 `usb`；loader.efi 与 EDK2 FV 中当前 loader 摘要一致；结构符合单核 one-shot + UFS 根卷路径。SHA-256：`567dd54432241492064155ee6a8c73a5835dc18dc98aa93a0feab3d9e24c176b`。 |
-| `.work/candidates/fajita-checkpoint-999-v2/boot-fajita-checkpoint-999.img` | `loader.efi`, `kernel`, `cmdline`, `checkpoint` | loader return-path 自检镜像，不含 flashboot/root APFS，也不继续启动 iOS；保留作诊断产物，不作为本轮推荐启动镜像。 |
+`patches/fajita-loader-ufs-handoff.patch` 额外加入同核拒绝检查。如果 UEFI 恰好已经位于所选 core 7，loader 显示原因并返回保持路径，不会尝试没有存储服务的交接。新日志包含 UEFI/XNU MPIDR 与 UFS 模式。PSCI 是否能在 fajita 启动该核心仍需运行证据。
 
-v2 payload 的 cmdline 为 `-v bootcpu=0 cpus=1 ufs=2 root_apfs=ufs_darwin vtimer_intid=19`。Dipper XNU 的 GIC 实现支持读取这个参数；本轮 `bash xnu-build.sh -j8 build` 返回 0，内核中可见 `vtimer_intid` 路径。19 是 dipper SDM845 实测值，不是 fajita 独立测值；这里明确选择同 SoC 已知值，不再额外要求 timer-probe 轮次。候选固定从 core 0 单核启动，不依赖 PSCI 拉起其它核心。
+### 3. 在 PEI 内存表中预留 XNUP
 
-旧 v1 payload 中 `loader.efi` 与 FV loader 不同。v2 已用 `XnuLoaderPkg/Binary/loader.efi` 重打包，XNUP 和 EDK2 FV 中的 SHA-256 都为 `0b291aaaa4f96a4574565c7bf1c2c155eb928998661e3f95b0c829ccf1698eef`，消除了该版本漂移。
+BootShim 在 UEFI 启动前把 XNUP 复制到 `0xF0000000`。旧 SDM845 内存表把该地址包含在 conventional RAM 中。loader 自己避开该范围，不能防止固件在 loader 执行前分配它。
 
-## 已知与未知
+fajita DSC 现在选择本项目自己的 `PlatformMemoryMapLib`。4/6/8/10 GiB 四种表都在原 RAM 区间内拆出 `0xF0000000..0xF4000000`（64 MiB），标为 `EfiReservedMemoryType`。其余部分保持 conventional RAM，原起止地址不变，没有额外叠加重叠的内存 HOB。预留也覆盖 loader 使用的末端 1 MiB panic log；打包器相应禁止 payload 越过这个边界。
 
-可以确定：旧无 USB 镜像缺少 XNUP；v7 缺少 dipper 配方中的 `flashboot`；缺少 `usb` 条目本身不会让 `run_kernel()` 被跳过；USB gadget 报错与 XNU 启动交接是不同阶段。
+已确认构建选择了这个库，编译后的 SEC 包含四项 `XNU Payload`，源码检查验证了四种容量表没有新增孔洞或重叠。
 
-尚不能从主机判定：设备最后运行过的每个镜像与屏幕现象是否一一对应；XNUP 是否在手机物理内存被 BootShim 正确复制；GOP/MIDR 最终选中的平台、fajita timer PPI、UEFI 传入的 UFS Block I/O 是否被 XNU 正确服务、XNU 是否已开始执行。历史轮次没有保存完整 loader/kernel log，因此不能把 9008 精确定位到其中某一项。
+## 当前启动链
 
-设备上的 UEFI logo 只证明 fastboot 启动的 Android boot image 至少进入了 BootShim/UEFI 显示阶段，不证明 XNUP 被读取、loader 被运行或 XNU 已执行。反过来，`dev_state_default_address` USB 状态错误也不能证明或否定 XNU 是否启动。
+1. Android boot v1 的 kernel 为 gzip(BootShim + 7 MiB UEFI FD + XNUP + 16 字节对齐填充)，后接 fajita 兼容 DTB。BootShim 为 192 字节，FD 基址 `0xCE000000`，XNUP 目的地址 `0xF0000000`。
+2. EDK2 在 PEI 阶段保留 XNUP 内存；DXE 完成驱动调度，BDS 连接控制器/控制台并执行内嵌 loader。
+3. loader 解析 XNUP，选择 fajita 平台并准备 XNU 内存窗口、设备树和 boot args。Qualcomm USB 驱动保留，但 payload 不含 `usb` 且有 `oneshot`；loader 不调用 `usb_start()`，`USB == NULL` 的 poll 立即返回。
+4. loader 在原 UEFI 核心提供固件 UFS 服务，XNU 通过 PSCI 在 core 7 执行。XNU 仅启用一个核心。
+5. `flashboot` 成为 `/dev/md0`，其中 stage0 `/sbin/launchd` 挂载 payload ramdisk（`/dev/md1`）到 `/redwood` 并执行 `/redwood/sbin/init`，再按 `root_apfs=ufs_darwin` 使用已写入设备的 APFS 系统。
 
-## 处理结论
+Android boot 头中的 ramdisk 是 EDK2 `build.sh` 生成的一字节换行占位，不是上述两份 APFS。旧历史模板使用五字节 `dummy`；新版直接使用本轮 EDK2 输出，校验器已对应区分，避免继续依赖旧模板。
 
-不再把多个 timer、checkpoint、USB 生命周期镜像排成多轮设备试验。当前主机侧重建出的唯一完整候选是 `fajita-singlecore-no-usb-v2`；如果你决定做一次设备确认，就只用它，不再轮流换镜像。若它仍重启/进 9008，先保留屏幕最后输出；在没有新的启动阶段证据前，不改 USB 或 GPT。
+## 构建与验证
 
-分区/APFS 记录及 EDL 输入状态仍见 [readme.md](readme.md) 和 [EDL_INPUTS.md](EDL_INPUTS.md)。
+```sh
+bash scripts/apply-fajita-to-dipper.sh
+```
+
+该脚本需要已经准备好的 `ref/dipper-xnu/work/{hackios,edk2}`、XNU 源码/依赖和 `hackios/userland/{flashboot,root}.apfs`。它不再依赖 `.work/candidates/` 中的历史镜像。仍不能宣称只靠本仓库的干净 checkout 就能构建：固定上游准备、工具链和 Apple 用户空间材料仍是前置输入。
+
+- `verify-fajita-source.py` 在编译前检查已同步的 BDS 源码、fajita DSC 库选择、四种内存表、同核 UFS 检查及 loader USB 绕过条件。
+- `verify-fajita-boot.py` 校验 boot/FDT/XNUP 长度、对齐、panic-log 边界、条目集合、命令行以及 loader/kernel/两份 APFS 的逐字节对应关系。还从最终镜像的 LZMA 压缩 FV 中解析真正的 APPLICATION FFS，确认固件内嵌 loader 与 XNUP 的 loader 一致，而非只比较旁边的中间文件。
+- loader PE 时间戳固定。EDK2 FD 在重复构建中仍有差异，具体来源未定位，不能称为整个镜像可重现；每轮以 `.work/build/fajita/SHA256SUMS` 为准。
+- XNU 使用现有工作树增量构建，内核为 15,442,352 字节，SHA-256 `02bcdfb941ba6fe25835aa47f82f28e775e37794e6113adf7b364eb19b04980a`。构建仍有已记录的 symbolset / `check_all_exports` 后置检查失败；不能据此宣称完成了干净的全量 XNU 构建。本轮没有改变 XNU 内核代码。
+- Python APFS 读取器确认启动卷 `/sbin/launchd`、第二卷 `/sbin/init` 与 SpringBoard plist 存在、所有者为 root；解压读出的 stage0/init 与 `userland/obj/{stage0,init}` 逐字节相同。本地系统镜像的 `SystemVersion.plist` 可读取。这是主机镜像检查，不是设备上已启动用户空间的证据。C APFS 检查工具因缺少 OpenSSL 开发头文件未编译成功，不算其验证通过。
+
+最终镜像、prefix、XNUP、构建日志与校验日志都在 `.work/build/fajita/`。中间文件保持在项目内。
+
+## 历史候选与剩余未知
+
+旧 `.work/artifacts/fajita/boot-fajita-no-usb.img` 没有 XNUP，不能启动内核。`boot-fajita-direct-apfs-v7.img` 有 kernel，却缺少完整 UFS 根卷配方的 `flashboot`。后来完整的同核候选仍在实机进入 9008。这些是不同镜像，不能合并成“禁 USB 必然造成 9008”的结论。
+
+dipper 是主要参考，覆盖 `docs/development/FIRST_INSTALL.md`、`docs/build/BUILD.md`、`docs/build/USERLAND.md`、`docs/install/STARTUP.md` 和实际 loader。`ref/hakios-uefi` 的 Mu-Silicium 集成属于另一条 UEFI 路线，不能直接混用；HakiOS 通用设备层仍是 provisional 状态。
+
+仍需运行证据确认：最后进入的引导阶段、fajita 的 PSCI 核间启动、GIC virtual-timer PPI、GOP/MIDR 平台识别结果、固件 UFS mailbox 的读取，以及 XNU 首条输出。PPI 19 来自 dipper 实测，不是 fajita 实测。新版修正上述静态问题后仍可能暴露其它平台问题，尚不能保证不进入 9008。
+
+GPT/APFS 已写入的具体过程和首尾回读范围见 `readme.md`。没有新证据前不重改 GPT；不刷 boot 分区，实机启动仍采用经授权的 `fastboot boot`。

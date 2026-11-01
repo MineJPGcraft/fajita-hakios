@@ -1,0 +1,17 @@
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -2981,6 +2981,14 @@
+ 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
+ 		    c[11] <= '9';
+ 	}
++	/* Firmware-backed UFS needs this core in run_on_other_cpu() to poll the
++	 * mailbox. A same-core jump abandons that service forever. */
++	if (ufs_requested >= 2 && kernel_mpidr == this_mpidr && checkpoint != CHECKPOINT_SELFTEST) {
++		print("ufs: refusing same-core handoff; select another bootcpu for the firmware block server\n");
++		return 0;
++	}
++	print("handoff: UEFI core %x, XNU core %x, UFS mode %d\n", this_mpidr, kernel_mpidr,
++	    (uint64_t)ufs_requested);
+ 	if (battery_requested) {
+ 		charger_start();
+ 	}

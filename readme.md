@@ -49,8 +49,13 @@ edk2-sdm845       e1952621f419f8db60ed28271264e1b5184c571d
 - 所有手机专属驱动在 fajita 配置中关闭。dipper 的 A630、Goodix/触控、WCN3990 和存储参数未直接复用。
 - EDL `boot_a/dtbo_a` 已提取出 3 个 SDM845 base DTB 和 16 个 Qualcomm DTBO；它们作为设备 EDL 树使用，不因 Android 版本不同而作废。官方 system/vendor 属于 Android 10 build `2101210516`，用于厂商固件与配置参考。提取和输入状态见 [EDL_INPUTS.md](EDL_INPUTS.md)。
 - `scripts/prepare-fajita.sh` 只同步设备层、运行设备检查并生成 `fajita_defconfig`；通用首轮不改 loader 或 XNU。
-- `patches/fajita-loader.patch` 与 `patches/fajita-gic-timer.patch` 是未验证的实验补丁，timer 值 19 仅来自 dipper，不能作为 fajita 已确认参数；暂不纳入通用准备流程。
-- `scripts/apply-fajita-to-dipper.sh` 可在 dipper 的固定 SDM845 源码准备完成后，替换 loader 平台名、关闭未核验的 UFS 写入，并重建 ARM64 loader。
+- `patches/fajita-gic-timer.patch` 为 SDM845 参考补丁；timer 值 19 来自 dipper，仍不是 fajita 实测值。
+- `scripts/apply-fajita-to-dipper.sh` 在已准备的 dipper SDM845 工作树上应用 fajita loader/XNU/UEFI 改动，增量检查 XNU、构建 loader 与 EDK2，并把 one-shot 镜像写到 `.work/build/fajita/`。loader PE 时间戳固定；EDK2 FD 尚有未定位的构建差异，最终 hash 以每轮 `SHA256SUMS` 为准。该脚本只在主机运行，不操作手机。
+- 当前 UEFI 恢复 dipper 的 BDS 启动顺序；`XnuLoaderDxe` 只注册 BootOrder，不在 DXE 调度期间直接执行 loader。fajita 专用内存表在 PEI 阶段预留 `0xF0000000..0xF4000000`，避免固件分配覆盖 BootShim 放入的 XNUP。
+- `devices/fajita/bootargs.txt` 使用 `bootcpu=7 cpus=1 ufs=2`：XNU 只用一个核心，但 UEFI 在原核继续提供 UFS mailbox 服务。loader 新增同核 UFS 交接拒绝检查；单纯的 `bootcpu=0 cpus=1` 会在 UEFI 本来运行于 core 0 时丢失存储服务。
+- `scripts/verify-fajita-source.py` 检查启动时机、4/6/8/10 GiB 内存表的预留和端点、UFS 核心检查与 loader USB 绕过逻辑。`scripts/verify-fajita-boot.py` 检查 boot/FDT/XNUP 边界、输入摘要及两份 APFS，并从镜像内实际解压 FV，确认内嵌 loader 与 XNUP 中一致。打包直接使用本轮 EDK2 boot 和用户空间 APFS，不再依赖历史候选模板。
+
+上一版 `.work/build/fajita/boot-fajita-singlecore-no-usb.img`（SHA-256 `546689dbf549ede970c4ae55eccb80c5b137718aec3bb85f3b4913be96974fb2`）实机仍进入 9008，已停止推荐。新版为 `.work/build/fajita/boot-fajita-ufs-no-usb.img`；构建与主机校验记录位于同目录。新版尚未实机验证，timer PPI 19 仍待 fajita 确认；不能将构建成功视为 XNU 启动成功。
 
 当前 `devices/fajita` 是移植草案，不代表已在 OnePlus 6T 实机启动或验证。
 
@@ -83,4 +88,4 @@ edk2-sdm845       e1952621f419f8db60ed28271264e1b5184c571d
 3. 从设备分别回读主表和备表，并重新计算 GPT header CRC 和条目 CRC。主表文件与回读文件 SHA-256 都是 `dbfd90b8d299b34f64c02d3bc2495522c04ced5b8b9a2073f6f131368b98ffe2`；备表文件与回读文件 SHA-256 都是 `e32d7e977c59e72c7f0e13317dd97f8a4a390489ad8d0b890e68886b08443fcc`。主表 header CRC 为 `a784873a`，备表 header CRC 为 `12b634fd`，两边条目 CRC 均为 `ead1bfb1`，计算值与 GPT 内记录一致。
 4. 将 APFS 镜像写入 `darwin` 的起始 LBA `25193984`。写入文件 `.work/fajita-apfs/darwin-system.img` 大小为 `8365539328` 字节，SHA-256 为 `9efb156f417e32b6f92d709af33c0e8e584693c3fbd29eaf139b57eee3735560`。设备端回读首 1 MiB 和末 1 MiB，均与镜像对应区域逐字节匹配；没有做完整 8.36 GB 镜像回读。
 
-因此可以确认 GPT 已按上表写入，`darwin` 的首尾抽样也已写入。设备启动失败与 GPT 写入结论分开记录；没有完整实机 loader/kernel 日志时，不把 9008 归因于 GPT、USB 或某个 XNU 子系统。对 dipper 完整启动链与 fajita 候选的主机侧核对见 [fajita 迁移审计](FAJITA_MIGRATION_AUDIT.md)。已按审计修正 XNU timer 参数接线并重打唯一完整单核 one-shot 候选，细节和摘要见审计文档。
+因此可以确认 GPT 已按上表写入，`darwin` 的首尾抽样也已写入。设备启动失败与 GPT 写入结论分开记录；没有完整实机 loader/kernel 日志时，不把 9008 归因于 GPT、USB 或某个 XNU 子系统。对 dipper 完整启动链、失败候选及当前 BDS/UFS/内存预留修复见 [fajita 迁移审计](FAJITA_MIGRATION_AUDIT.md)。本轮未改 GPT、未刷 boot、未操作设备；Qualcomm USB DXE 保留，仅跳过 loader USB 服务。

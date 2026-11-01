@@ -46,15 +46,12 @@ def main():
     payload = open(args.payload, "rb").read()
     if payload[:4] != b"XNUP":
         raise SystemExit("payload is not XNUP")
-    marker = image.find(b"XNUP")
-    if marker < 0:
-        # A freshly built BootShim+FD has no payload yet. The shim expects the
-        # XNUP container immediately after the FD, so append it verbatim.
-        image.extend(payload)
-    else:
-        if marker + len(payload) > len(image):
-            raise SystemExit("payload does not fit the reserved UEFI ARM image")
-        image[marker:] = payload + bytes(len(image) - marker - len(payload))
+    # Only accept the reviewed BootShim+FD prefix. Searching the firmware for
+    # the bytes XNUP can mistake a loader constant/string for a container.
+    if len(image) != 192 + 0x700000:
+        raise SystemExit("expected a 192-byte BootShim plus 7 MiB FD without an old payload")
+    image.extend(payload)
+    image.extend(bytes(-len(payload) % 16))
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
     os.makedirs(out_dir, exist_ok=True)

@@ -35,6 +35,7 @@
 
 [LibraryClasses.common]
   UniXNULib|UniXNUPkg/Library/UniXNULib/UniXNULib.inf
+  PlatformMemoryMapLib|Platform/Oneplus/sdm845/Library/PlatformMemoryMapLib/PlatformMemoryMapLib.inf
 
 [Components.common]
   XnuLoaderPkg/Driver/XnuLoaderDxe/XnuLoaderDxe.inf
