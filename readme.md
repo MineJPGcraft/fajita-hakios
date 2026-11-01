@@ -83,4 +83,4 @@ edk2-sdm845       e1952621f419f8db60ed28271264e1b5184c571d
 3. 从设备分别回读主表和备表，并重新计算 GPT header CRC 和条目 CRC。主表文件与回读文件 SHA-256 都是 `dbfd90b8d299b34f64c02d3bc2495522c04ced5b8b9a2073f6f131368b98ffe2`；备表文件与回读文件 SHA-256 都是 `e32d7e977c59e72c7f0e13317dd97f8a4a390489ad8d0b890e68886b08443fcc`。主表 header CRC 为 `a784873a`，备表 header CRC 为 `12b634fd`，两边条目 CRC 均为 `ead1bfb1`，计算值与 GPT 内记录一致。
 4. 将 APFS 镜像写入 `darwin` 的起始 LBA `25193984`。写入文件 `.work/fajita-apfs/darwin-system.img` 大小为 `8365539328` 字节，SHA-256 为 `9efb156f417e32b6f92d709af33c0e8e584693c3fbd29eaf139b57eee3735560`。设备端回读首 1 MiB 和末 1 MiB，均与镜像对应区域逐字节匹配；没有做完整 8.36 GB 镜像回读。
 
-因此可以确认 GPT 已按上表写入，`darwin` 的首尾抽样也已写入。设备启动失败与 GPT 写入结论分开记录；没有完整实机 loader/kernel 日志时，不把 9008 归因于 GPT、USB 或某个 XNU 子系统。对 dipper 完整启动链与 fajita 候选的主机侧核对见 [fajita 迁移审计](FAJITA_MIGRATION_AUDIT.md)。该审计不要求反复刷诊断镜像；当前只保留一个结构完整的单核 one-shot 候选作为后续唯一设备确认对象。
+因此可以确认 GPT 已按上表写入，`darwin` 的首尾抽样也已写入。设备启动失败与 GPT 写入结论分开记录；没有完整实机 loader/kernel 日志时，不把 9008 归因于 GPT、USB 或某个 XNU 子系统。对 dipper 完整启动链与 fajita 候选的主机侧核对见 [fajita 迁移审计](FAJITA_MIGRATION_AUDIT.md)。已按审计修正 XNU timer 参数接线并重打唯一完整单核 one-shot 候选，细节和摘要见审计文档。

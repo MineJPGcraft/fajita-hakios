@@ -6,7 +6,7 @@
 
 此前反复回到 9008 的候选并非同一条完整启动链：旧 `boot-fajita-no-usb.img` 在 UEFI FD 后没有 `XNUP`，根本没有可执行的 XNU；`boot-fajita-direct-apfs-v7.img` 虽含 kernel，却只有 4 MiB `ramdisk`，没有 dipper 的 `flashboot` 启动卷，不能视为 dipper 文档中的完整 UFS 根卷启动载荷。因而此前的启动结果不能证明“USB 导致 9008”，也不能用来断言当前完整候选会失败在哪个 XNU 初始化阶段。
 
-在 dipper 的 loader 实现中，不带 `usb` 的 payload 仍会进入 `run_kernel()`；`oneshot` 只让 loader 跳过 USB fastboot 服务后执行内嵌 kernel。当前 `.work/candidates/fajita-singlecore-no-usb-v1/boot-fajita-singlecore-no-usb.img` 的 XNUP 结构已包含 `loader.efi`、`flashboot`、`kernel`、`ramdisk`、cmdline 和 `oneshot`，并使用单核、`ufs=2 root_apfs=ufs_darwin`。从主机静态证据看，它才与 dipper 的完整 UFS 启动路径相符；尚无该镜像的实机结果，不能宣称它已能启动。
+在 dipper 的 loader 实现中，不带 `usb` 的 payload 仍会进入 `run_kernel()`；`oneshot` 只让 loader 跳过 USB fastboot 服务后执行内嵌 kernel。当前唯一候选 `.work/candidates/fajita-singlecore-no-usb-v2/boot-fajita-singlecore-no-usb.img` 的 XNUP 结构已包含最新 `loader.efi`、`flashboot`、`kernel`、`ramdisk`、cmdline 和 `oneshot`，显式选择单核、`ufs=2 root_apfs=ufs_darwin` 和 PPI 19。从主机静态证据看，它与 dipper 的完整 UFS one-shot 路径相符；尚无该镜像的实机结果，不能宣称它已能启动。
 
 ## 参考仓库各自覆盖什么
 
@@ -34,12 +34,12 @@
 | --- | --- | --- |
 | `.work/artifacts/fajita/boot-fajita-no-usb.img` | 无 XNUP | 确定错误：loader 没有 kernel，不能启动 XNU。 |
 | `.work/artifacts/fajita/boot-fajita-direct-apfs-v7.img` | `kernel`, `ramdisk`, `cmdline` | 有 kernel，但没有 `flashboot`；不完整匹配 dipper 的 UFS 根卷配方。 |
-| `.work/candidates/fajita-singlecore-no-usb-v1/boot-fajita-singlecore-no-usb.img` | `loader.efi`, `flashboot`, `kernel`, `ramdisk`, `cmdline`, `oneshot` | payload 长度、XNUP 条目和末尾边界一致；没有 `usb`；结构符合单核 one-shot + UFS 根卷路径。SHA-256：`ec613de648e2cbff8478dedfd3abbd0c3ca03e7c3b783ecb4a0d8807cde2f3cb`。 |
+| `.work/candidates/fajita-singlecore-no-usb-v2/boot-fajita-singlecore-no-usb.img` | `loader.efi`, `flashboot`, `kernel`, `ramdisk`, `cmdline`, `oneshot` | payload 长度、XNUP 条目和末尾边界一致；没有 `usb`；loader.efi 与 EDK2 FV 中当前 loader 摘要一致；结构符合单核 one-shot + UFS 根卷路径。SHA-256：`567dd54432241492064155ee6a8c73a5835dc18dc98aa93a0feab3d9e24c176b`。 |
 | `.work/candidates/fajita-checkpoint-999-v2/boot-fajita-checkpoint-999.img` | `loader.efi`, `kernel`, `cmdline`, `checkpoint` | loader return-path 自检镜像，不含 flashboot/root APFS，也不继续启动 iOS；保留作诊断产物，不作为本轮推荐启动镜像。 |
 
-当前完整 one-shot payload 中实际的 cmdline 字符串为 `-v ufs=2 root_apfs=ufs_darwin vtimer_intid=27`；loader 在没有 `cpus=` 时自动追加 `cpus=1`，没有 `bootcpu=` 时使用当前执行核心。`27` 是 XNU 的默认虚拟 timer PPI，`19` 来自 dipper 的 SDM845 实测；fajita 尚无独立 timer 观测，因此该参数仍是假设。该候选是单核配置，不依赖 PSCI 启动其余核心。
+v2 payload 的 cmdline 为 `-v bootcpu=0 cpus=1 ufs=2 root_apfs=ufs_darwin vtimer_intid=19`。Dipper XNU 的 GIC 实现支持读取这个参数；本轮 `bash xnu-build.sh -j8 build` 返回 0，内核中可见 `vtimer_intid` 路径。19 是 dipper SDM845 实测值，不是 fajita 独立测值；这里明确选择同 SoC 已知值，不再额外要求 timer-probe 轮次。候选固定从 core 0 单核启动，不依赖 PSCI 拉起其它核心。
 
-还有一个构建一致性细节：当前 one-shot 的 XNUP `loader.efi` 条目早于最后一次 loader 重建，SHA-256 为 `db6053ff4da766c6b29eac0817ac9b84d094142992758a86fa129cdcf656f264`；dipper EDK2 FV 中 `XnuLoaderPkg/Binary/loader.efi` 为 `0b291aaaa4f96a4574565c7bf1c2c155eb928998661e3f95b0c829ccf1698eef`。当前 `XnuLoaderDxe.c` 从 FV 路径直接 `LoadImage`，所以这条 EDK2 路线上有效 loader 是 FV 副本，XNUP 中同名条目不会替换它。该不一致不解释已观察的 9008，但应在下一次生成发布候选时统一，避免更换到读取 XNUP loader 的 UEFI 入口后加载旧版本。
+旧 v1 payload 中 `loader.efi` 与 FV loader 不同。v2 已用 `XnuLoaderPkg/Binary/loader.efi` 重打包，XNUP 和 EDK2 FV 中的 SHA-256 都为 `0b291aaaa4f96a4574565c7bf1c2c155eb928998661e3f95b0c829ccf1698eef`，消除了该版本漂移。
 
 ## 已知与未知
 
@@ -51,6 +51,6 @@
 
 ## 处理结论
 
-不再把多个 timer、checkpoint、USB 生命周期镜像排成多轮设备试验。当前主机审计完成后，唯一结构完整的现成候选是 `fajita-singlecore-no-usb-v1`；若后续要做一次设备确认，只应选这个候选并保留屏幕/loader 结果，不能再把旧 v7 或无 XNUP 的镜像当成对照。若它仍重启/进 9008，下一步应先取得一次完整的 loader 屏幕/日志证据，再修改启动链；不应继续盲改 timer、USB 或 GPT。
+不再把多个 timer、checkpoint、USB 生命周期镜像排成多轮设备试验。当前主机侧重建出的唯一完整候选是 `fajita-singlecore-no-usb-v2`；如果你决定做一次设备确认，就只用它，不再轮流换镜像。若它仍重启/进 9008，先保留屏幕最后输出；在没有新的启动阶段证据前，不改 USB 或 GPT。
 
 分区/APFS 记录及 EDL 输入状态仍见 [readme.md](readme.md) 和 [EDL_INPUTS.md](EDL_INPUTS.md)。
