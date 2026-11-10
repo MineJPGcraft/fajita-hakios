@@ -82,6 +82,8 @@ ensure_gic_timer_patch "$HACKIOS_ROOT" "$HACKIOS_ROOT/xnu/files/osfmk/arm64/gic_
 ensure_gic_timer_patch "$XNU_SRC" "$XNU_SRC/osfmk/arm64/gic_v3_irq.c" 3
 python3 "$ROOT/scripts/audit-fajita-touch-dt.py"
 python3 "$ROOT/scripts/ensure-fajita-touch.py" --xnu "$XNU_SRC" --extra-files "$HACKIOS_ROOT/xnu/files"
+python3 "$ROOT/scripts/ensure-fajita-gpu.py" --xnu "$XNU_SRC" --extra-files "$HACKIOS_ROOT/xnu/files"
+python3 "$ROOT/scripts/verify-fajita-gpu.py" --dtb "$ROOT/.work/edl-extract/boot/fajita-edl-a-0.dtb"
 python3 "$ROOT/scripts/ensure-fajita-live.py" --xnu "$XNU_SRC" --extra-files "$HACKIOS_ROOT/xnu/files" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
 python3 "$ROOT/scripts/ensure-fajita-touch-rpmh.py" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
 python3 "$ROOT/scripts/ensure-fajita-touch-panel.py" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
