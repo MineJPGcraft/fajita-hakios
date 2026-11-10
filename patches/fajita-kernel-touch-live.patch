@@ -1,0 +1,31 @@
+--- a/osfmk/arm64/loader_return.c
++++ b/osfmk/arm64/loader_return.c
+@@ -25,6 +25,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <vm/vm_page.h>
++#include "fajita_touch_live.h"
+ #include <vm/vm_compressor.h>
+ 
+ /*
+@@ -200,7 +201,12 @@
+ 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
+ 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
+ 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
++	uint64_t magic3, size;          /* append-only fajita diagnostic extension */
++	const struct fajita_touch_live *touch_live;
+ };
++_Static_assert(__builtin_offsetof(struct loader_live, sound) == 88, "preserve loader live ABI");
++_Static_assert(__builtin_offsetof(struct loader_live, magic3) == 96, "append diagnostics after old ABI");
++_Static_assert(sizeof(struct loader_live) == 120, "paired loader live size");
+ 
+ /*
+  * A screen recording (the display driver makes one with boot-arg rec_secs): where it is, for the
+@@ -215,6 +221,7 @@
+ 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
+ 	.recording = loader_recording,
+ 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
++	.magic3 = FAJITA_LIVE_MAGIC3, .size = sizeof(struct loader_live), .touch_live = &fajita_touch_live,
+ };
+ 
+ /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */

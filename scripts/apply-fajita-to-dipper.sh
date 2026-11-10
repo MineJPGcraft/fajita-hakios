@@ -5,6 +5,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DIPPER_ROOT=${DIPPER_ROOT:-"$ROOT/ref/dipper-xnu"}
+CMDLINE_FILE=${FAJITA_BOOTARGS_FILE:-"$ROOT/devices/fajita/bootargs.txt"}
 HACKIOS_ROOT="$DIPPER_ROOT/work/hackios"
 EDK2_ROOT="$DIPPER_ROOT/work/edk2"
 XNU_SRC="$HACKIOS_ROOT/xnu-src/xnu-8796.121.2"
@@ -46,12 +47,45 @@ ensure_reproducible_loader() {
 	python3 "$ROOT/scripts/ensure-loader-repro.py" "$HACKIOS_ROOT/xnuloader/build.sh"
 }
 
+ensure_fault_observation() {
+	# The later cache-scope patch changes context around two observation hunks.
+	# Recognize the complete observation layer before using git's reverse check.
+	local source="$HACKIOS_ROOT/xnuloader/loader.c" marker
+	local complete=1
+	for marker in 'UEFI fault held' 'UEFI context saved, preparing caches' \
+	    'cache preparation complete' 'masking firmware-core interrupts before PSCI' \
+	    'requesting PSCI CPU_ON core' 'secondary core reached the entry stub'; do
+		rg -Fq "$marker" "$source" || complete=0
+	done
+	if [ "$complete" -eq 1 ]; then
+		echo "screen fault observation already applied"
+	else
+		apply_once "$HACKIOS_ROOT" "$ROOT/patches/fajita-loader-fault-observation.patch" 1 "screen fault observation"
+	fi
+}
+
 apply_once "$HACKIOS_ROOT" "$ROOT/patches/fajita-after-dipper-loader.patch" 1 "fajita platform patch"
 ensure_reproducible_loader
 ensure_midr_fallback
 apply_once "$HACKIOS_ROOT" "$ROOT/patches/fajita-loader-ufs-handoff.patch" 1 "UFS handoff guard"
+ensure_fault_observation
+apply_once "$HACKIOS_ROOT" "$ROOT/patches/fajita-loader-secondary-cache.patch" 1 "secondary-core cache scope"
+apply_once "$HACKIOS_ROOT" "$ROOT/patches/fajita-loader-framebuffer-owner.patch" 1 "desktop framebuffer ownership"
+python3 "$ROOT/scripts/ensure-fajita-touch-power.py" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
+if rg -q 'fajita_log_tail_spans\(' "$HACKIOS_ROOT/xnuloader/loader.c" && \
+   rg -q 'note_touch_progress\(live, slide, noted\)' "$HACKIOS_ROOT/xnuloader/loader.c"; then
+	echo "paired touch diagnostic reader already staged"
+else
+	apply_once "$HACKIOS_ROOT" "$ROOT/patches/fajita-loader-touch-observe.patch" 1 "opt-in touch diagnostic log visibility"
+fi
 ensure_gic_timer_patch "$HACKIOS_ROOT" "$HACKIOS_ROOT/xnu/files/osfmk/arm64/gic_v3_irq.c" 1
 ensure_gic_timer_patch "$XNU_SRC" "$XNU_SRC/osfmk/arm64/gic_v3_irq.c" 3
+python3 "$ROOT/scripts/audit-fajita-touch-dt.py"
+python3 "$ROOT/scripts/ensure-fajita-touch.py" --xnu "$XNU_SRC" --extra-files "$HACKIOS_ROOT/xnu/files"
+python3 "$ROOT/scripts/ensure-fajita-live.py" --xnu "$XNU_SRC" --extra-files "$HACKIOS_ROOT/xnu/files" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
+python3 "$ROOT/scripts/ensure-fajita-touch-rpmh.py" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
+python3 "$ROOT/scripts/ensure-fajita-touch-panel.py" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
+python3 "$ROOT/scripts/verify-fajita-touch.py" --xnu "$XNU_SRC"
 
 mkdir -p "$EDK2_ROOT/Platform/Oneplus/sdm845"
 cp -a "$ROOT/devices/fajita/uefi/files/Platform/Oneplus/sdm845/." "$EDK2_ROOT/Platform/Oneplus/sdm845/"
@@ -65,7 +99,7 @@ fi
 
 mkdir -p "$EDK2_ROOT/XnuLoaderPkg/Binary"
 cp "$HACKIOS_ROOT/xnuloader/loader.efi" "$EDK2_ROOT/XnuLoaderPkg/Binary/loader.efi"
-BUILD_DIR="$ROOT/.work/build/fajita"
+BUILD_DIR="${FAJITA_BUILD_DIR:-$ROOT/.work/build/fajita}"
 KERNEL="$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837"
 GIC_SOURCE="$XNU_SRC/osfmk/arm64/gic_v3_irq.c"
 mkdir -p "$BUILD_DIR"
@@ -78,8 +112,19 @@ if [ ! -s "$KERNEL" ]; then
 	echo "XNU build did not produce a kernel; see $BUILD_DIR/xnu-build.log" >&2
 	exit 1
 fi
-if [ "$GIC_SOURCE" -nt "$KERNEL" ]; then
-	echo "XNU kernel is older than its GIC timer source; rebuild did not update the kernel" >&2
+for source in "$GIC_SOURCE" "$XNU_SRC/bsd/dev/fajita_synaptics.c" \
+    "$XNU_SRC/bsd/dev/fajita_touch_transport.inc" "$XNU_SRC/bsd/dev/fajita_touch_report.h" \
+    "$XNU_SRC/bsd/dev/fajita_touch_board.h" "$XNU_SRC/bsd/dev/fajita_touch_layout_probe.inc" \
+    "$XNU_SRC/bsd/sys/fajita_touch_live.h" "$XNU_SRC/osfmk/arm64/loader_return.c" \
+    "$XNU_SRC/osfmk/arm64/fajita_touch_live.h" \
+    "$XNU_SRC/bsd/conf/files" "$XNU_SRC/bsd/dev/redwood_input.c" "$XNU_SRC/bsd/sys/redwood_input.h"; do
+	if [ "$source" -nt "$KERNEL" ]; then
+		echo "XNU kernel is older than $source; refusing a stale kernel" >&2
+		exit 1
+	fi
+done
+if ! llvm-nm "$KERNEL" | rg '_fajita_touch_init$' > /dev/null; then
+	echo "XNU kernel lacks fajita_touch_init; refusing a kernel without the touch driver" >&2
 	exit 1
 fi
 if [ "$XNU_STATUS" -ne 0 ] && ! rg -q 'check_all_exports' "$BUILD_DIR/xnu-build.log"; then
@@ -87,10 +132,24 @@ if [ "$XNU_STATUS" -ne 0 ] && ! rg -q 'check_all_exports' "$BUILD_DIR/xnu-build.
 	exit "$XNU_STATUS"
 fi
 echo "XNU kernel available after incremental build: $KERNEL ($(stat -c %s "$KERNEL") bytes)"
+python3 "$ROOT/scripts/verify-fajita-live.py" --kernel "$KERNEL" --loader "$HACKIOS_ROOT/xnuloader/loader.efi"
+# EDK2's bundled BaseTools predate the host's GCC and treat old-code warnings as
+# errors (-Werror). The reference tree stays untouched: BUILD_OPTFLAGS is
+# appended after every BUILD_CFLAGS definition, so this only relaxes warnings.
+# It never changes -D flags (e.g. LzmaCompress's -D_7ZIP_ST) or code generation.
+BASETOOLS="$EDK2_ROOT/Common/edk2/BaseTools"
+if ! make -C "$BASETOOLS" BUILD_OPTFLAGS="-Wno-error" > "$BUILD_DIR/basetools-build.log" 2>&1; then
+	tail -40 "$BUILD_DIR/basetools-build.log" >&2
+	exit 1
+fi
 if ! (cd "$EDK2_ROOT" && bash build.sh -d fajita) > "$BUILD_DIR/edk2-build.log" 2>&1; then
 	tail -80 "$BUILD_DIR/edk2-build.log" >&2
 	exit 1
 fi
+# A review can update project inputs while the firmware build is running.
+# Refuse a package whose staged sources no longer match those inputs.
+python3 "$ROOT/scripts/verify-fajita-source.py" --edk2 "$EDK2_ROOT" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
+python3 "$ROOT/scripts/verify-fajita-touch.py" --xnu "$XNU_SRC"
 
 BASE_IMAGE="$EDK2_ROOT/boot-fajita.img"
 FLASHBOOT="$HACKIOS_ROOT/userland/flashboot.apfs"
@@ -102,11 +161,11 @@ done
 cp "$UEFI_PREFIX" "$BUILD_DIR/uefi-bootshim-fd.bin"
 UEFI_PREFIX="$BUILD_DIR/uefi-bootshim-fd.bin"
 PAYLOAD="$BUILD_DIR/uefi-payload.bin"
-ONE_SHOT="$BUILD_DIR/boot-fajita-ufs-no-usb.img"
+ONE_SHOT="$BUILD_DIR/boot-fajita-touch-panel.img"
 python3 "$ROOT/scripts/rebuild-fajita-payload.py" \
 	--loader "$HACKIOS_ROOT/xnuloader/loader.efi" --kernel "$KERNEL" \
 	--flashboot "$FLASHBOOT" --ramdisk "$RAMDISK" \
-	--cmdline-file "$ROOT/devices/fajita/bootargs.txt" --output "$PAYLOAD"
+		--cmdline-file "$CMDLINE_FILE" --output "$PAYLOAD"
 python3 "$ROOT/scripts/repack-fajita-uefi.py" \
 	--boot "$BASE_IMAGE" --uefi-image "$UEFI_PREFIX" --payload "$PAYLOAD" \
 	--mkbootimg "$EDK2_ROOT/tools/mkbootimg.py" --output "$ONE_SHOT"
@@ -115,6 +174,6 @@ python3 "$ROOT/scripts/verify-fajita-boot.py" "$ONE_SHOT" \
 	--dtb "$EDK2_ROOT/Platform/Oneplus/sdm845/FdtBlob_compat/fajita.dtb" \
 	--loader "$HACKIOS_ROOT/xnuloader/loader.efi" --kernel "$KERNEL" \
 	--flashboot "$FLASHBOOT" --ramdisk "$RAMDISK" \
-	--cmdline-file "$ROOT/devices/fajita/bootargs.txt"
+		--cmdline-file "$CMDLINE_FILE"
 sha256sum "$ONE_SHOT" > "$BUILD_DIR/SHA256SUMS"
 echo "fajita one-shot image rebuilt and verified: $ONE_SHOT. No device operation was performed."

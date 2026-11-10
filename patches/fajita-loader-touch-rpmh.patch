@@ -1,0 +1,36 @@
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -2955,6 +2955,8 @@
+  */
+ static int starts_with(const char *s, const char *prefix);
+ 
++#include "fajita_touch_rpmh.inc"
++
+ static int
+ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ {
+@@ -3126,6 +3128,7 @@
+ 	if (battery_requested) {
+ 		charger_start();
+ 	}
++	int fajita_touch_prepared = fajita_touch_prepare_before_handoff(pi.cmdline, this_mpidr, kernel_mpidr);
+ 	if (ufs_requested >= 2) {
+ 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
+ 	}
+@@ -3279,6 +3282,16 @@
+ 	for (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+ 		ba->commandLine[n++] = *c;
+ 	}
++	/* Only this final firmware-produced acknowledgement authorizes touch MMIO. */
++	if (PLAT == &platform_fajita) {
++		const char *ack = fajita_touch_prepared ? " fajita_touch_prepared=1" : " fajita_touch_prepared=0";
++		if (n + sizeof(" fajita_touch_prepared=0") > BOOT_LINE_LENGTH) {
++			print("fajita-power: no room for acknowledgement; refusing handoff\n");
++			return 0;
++		}
++		for (const char *c = ack; *c; c++) { ba->commandLine[n++] = *c; }
++	}
++	ba->commandLine[n] = 0;
+ 
+ 	/* --- device tree ---------------------------------------------------- */
+ 	const struct platform *plat = PLAT;

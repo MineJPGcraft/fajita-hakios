@@ -69,6 +69,7 @@ def verify_embedded_loader(prefix: bytes, loader: bytes) -> None:
         raise ValueError("invalid decompressed firmware volume header")
     off = (struct.unpack_from("<H", fv, 48)[0] + 7) & ~7
     applications = []
+    firmware_guids = set()
     while off + 24 <= len(fv) and fv[off:off + 24] != b"\xff" * 24:
         file_size = int.from_bytes(fv[off + 20:off + 23], "little")
         file_header = 24
@@ -79,9 +80,15 @@ def verify_embedded_loader(prefix: bytes, loader: bytes) -> None:
             file_header = 32
         if file_size < file_header or off + file_size > len(fv):
             raise ValueError("FFS file exceeds its firmware volume")
+        firmware_guids.add(fv[off:off + 16])
         if fv[off:off + 16] == loader_guid and fv[off + 18] == 9:
             applications.append(fv[off + file_header:off + file_size])
         off += (file_size + 7) & ~7
+    # The publisher (...a310) describes the device without polling. The actual
+    # RMI4 driver (...a309) installs a 20 ms I2C timer. It must not remain active
+    # while XNU owns the same pins; boot services stay resident for UFS.
+    if uuid.UUID("f0d87c5e-4d5d-4fb5-939f-a6768ae8a309").bytes_le in firmware_guids:
+        raise ValueError("firmware Synaptics polling driver would conflict with XNU touch")
     if len(applications) != 1:
         raise ValueError(f"expected one loader APPLICATION FFS, found {len(applications)}")
     sections = applications[0]

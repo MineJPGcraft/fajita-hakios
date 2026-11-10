@@ -1,0 +1,513 @@
+--- a/devices/fajita/loader/fajita_rpmh_transaction.h
++++ b/devices/fajita/loader/fajita_rpmh_transaction.h
+@@ -65,7 +65,8 @@
+ 	FAJITA_RPMH_REASON_RECHECK,
+ 	FAJITA_RPMH_REASON_PRETRIGGER_ROLLBACK,
+ 	FAJITA_RPMH_REASON_POSTTRIGGER_FATAL,
+-	FAJITA_RPMH_REASON_RESTORE_FATAL
++	FAJITA_RPMH_REASON_RESTORE_FATAL,
++	FAJITA_RPMH_REASON_UNWITNESSED_COMPLETION
+ };
+ #define FAJITA_RPMH_REJECT_STATUS 1u
+ #define FAJITA_RPMH_REJECT_CONTROL 2u
+@@ -353,21 +354,29 @@
+ 	ops->wr(ctx, slot + FAJITA_RPMH_CONTROL,
+ 	    FAJITA_RPMH_ENABLE | FAJITA_RPMH_TRIGGER);
+ 	if (diag) { diag->reason = FAJITA_RPMH_REASON_POSTTRIGGER_FATAL; }
++	bool witnessed = false;
+ 	for (unsigned n = 0; n < FAJITA_RPMH_COMPLETION_POLLS; n++) {
+-		if (ops->rd(ctx, FAJITA_RPMH_IRQ_STATUS) & bit) {
+-			for (unsigned command = 0; command < 3; command++) {
+-				uint32_t status = ops->rd(ctx, slot + FAJITA_RPMH_CMD_STATUS +
+-				    command * FAJITA_RPMH_CMD_STRIDE);
+-				if ((status & FAJITA_RPMH_COMMAND_OK) != FAJITA_RPMH_COMMAND_OK) {
+-					if (diag) { diag->offset = slot + FAJITA_RPMH_CMD_STATUS + command * FAJITA_RPMH_CMD_STRIDE; diag->value = status; }
+-					return FAJITA_RPMH_FATAL;
+-				}
++		/* Poll response-requested commands directly. IRQ_STATUS is not a
++		 * prerequisite for synchronous completion; its visibility while the
++		 * peripheral IRQ is masked has not been established on this firmware.
++		 * Old CMD_STATUS flags and idle can briefly survive a posted trigger.
++		 * Require post-trigger progress, or a newly pending selected IRQ (the
++		 * slot guards established it absent), before accepting three OK flags.
++		 */
++		bool all_complete = true;
++		for (unsigned command = 0; command < 3; command++) {
++			uint32_t offset = slot + FAJITA_RPMH_CMD_STATUS +
++			    command * FAJITA_RPMH_CMD_STRIDE;
++			uint32_t status = ops->rd(ctx, offset);
++			if ((status & FAJITA_RPMH_COMMAND_OK) != FAJITA_RPMH_COMMAND_OK) {
++				if (all_complete && diag) { diag->offset = offset; diag->value = status; }
++				all_complete = false;
+ 			}
+-			/* Completion must also leave the engine idle before any cleanup. */
+-			if (ops->rd(ctx, slot + FAJITA_RPMH_STATUS) == 0) {
+-				if (diag) { diag->offset = slot + FAJITA_RPMH_STATUS; diag->value = 0; }
+-				return FAJITA_RPMH_FATAL;
+-			}
++		}
++		uint32_t engine = ops->rd(ctx, slot + FAJITA_RPMH_STATUS);
++		uint32_t pending = ops->rd(ctx, FAJITA_RPMH_IRQ_STATUS);
++		if (!all_complete || engine == 0 || (pending & bit)) { witnessed = true; }
++		if (all_complete && engine != 0 && witnessed) {
+ 			if (!fajita_rpmh_restore_diagnostic(ops, ctx, index, &saved, true, diag)) {
+ 				if (diag) { diag->reason = FAJITA_RPMH_REASON_RESTORE_FATAL; }
+ 				return FAJITA_RPMH_FATAL;
+@@ -375,10 +384,18 @@
+ 			fajita_rpmh_diagnose(diag, FAJITA_RPMH_REASON_NONE, index, 0, 0);
+ 			return FAJITA_RPMH_READY;
+ 		}
++		/* Commands can finish before the engine reports idle. Keep waiting
++		 * within the same bound; do not clean up a still-running engine.
++		 */
++		if (all_complete && diag) {
++			diag->offset = engine == 0 ? slot + FAJITA_RPMH_STATUS : FAJITA_RPMH_IRQ_STATUS;
++			diag->value = engine == 0 ? 0 : pending;
++		}
+ 		if (n + 1 < FAJITA_RPMH_COMPLETION_POLLS && !ops->delay_us(ctx, 10)) {
+ 			return FAJITA_RPMH_FATAL;
+ 		}
+ 	}
++	if (!witnessed && diag) { diag->reason = FAJITA_RPMH_REASON_UNWITNESSED_COMPLETION; }
+ 	return FAJITA_RPMH_FATAL;
+ not_triggered:
+ 	if (!fajita_rpmh_restore_diagnostic(ops, ctx, index, &saved, false, diag)) {
+--- a/tests/test-fajita-rpmh-transaction.c
++++ b/tests/test-fajita-rpmh-transaction.c
+@@ -14,10 +14,13 @@
+ struct mock {
+ 	uint32_t reg[WORDS], original[WORDS];
+ 	struct write_event writes[96];
+-	unsigned nwrites, nreads, delays, irq_polls, trigger_at, selected;
++	unsigned nwrites, nreads, delays, irq_polls, command_polls, trigger_at, selected;
+ 	unsigned ready_after, fail_write_at, fail_delay_at;
++	unsigned hardware_ticks, command_done_at[3], engine_idle_at, irq_at;
++	unsigned trigger_accept_at;
+ 	bool triggered, completed, no_completion, keep_busy, fault_active;
+-	bool sticky_fault, ignore_irq_clear;
++	bool sticky_fault, ignore_irq_clear, suppress_irq, accepted;
++	bool observed_busy, observed_incomplete, observed_irq;
+ 	int bad_command;
+ 	uint32_t bad_command_status, fault_offset;
+ 	uint32_t mutate_offset, mutate_value;
+@@ -46,16 +49,47 @@
+ 	}
+ 	memcpy(m->original, m->reg, sizeof(m->reg));
+ }
+-static void complete(struct mock *m)
++/* Trigger submission and acceptance are distinct. A posted trigger may leave
++ * old completion flags and idle visible for several delay(10) ticks, or never
++ * be accepted at all. Neither acceptance nor progress is driven by MMIO reads.
++ * Separate command, engine and IRQ schedules permit misleading partial states.
++ */
++static void hardware_progress(struct mock *m)
+ {
+ 	assert(m->triggered && m->selected < 2);
+-	m->completed = true;
+-	m->reg[FAJITA_RPMH_IRQ_STATUS / 4] |= 1u << m->selected;
+-	if (!m->keep_busy) { m->reg[slot_offset(m->selected, FAJITA_RPMH_STATUS) / 4] = 1; }
++	if (!m->accepted) {
++		if (m->hardware_ticks < m->trigger_accept_at) { return; }
++		m->accepted = true;
++		uint32_t slot = slot_offset(m->selected, 0);
++		m->reg[(slot + FAJITA_RPMH_STATUS) / 4] = 0;
++		for (unsigned n = 0; n < 3; n++) {
++			m->reg[(slot + FAJITA_RPMH_CMD_STATUS + n * FAJITA_RPMH_CMD_STRIDE) / 4] = 0;
++		}
++	}
++	bool all_responded = true;
+ 	for (unsigned n = 0; n < 3; n++) {
++		unsigned due = m->command_done_at[n] ? m->command_done_at[n] : m->ready_after;
++		if (m->no_completion || m->hardware_ticks < due) { all_responded = false; continue; }
+ 		m->reg[(slot_offset(m->selected, FAJITA_RPMH_CMD_STATUS) +
+ 		    n * FAJITA_RPMH_CMD_STRIDE) / 4] =
+ 		    (int)n == m->bad_command ? m->bad_command_status : FAJITA_RPMH_COMMAND_OK;
++	}
++	m->completed = all_responded;
++	unsigned idle = m->engine_idle_at ? m->engine_idle_at : m->ready_after;
++	if (!m->keep_busy && m->hardware_ticks >= idle) {
++		m->reg[slot_offset(m->selected, FAJITA_RPMH_STATUS) / 4] = 1;
++	}
++	if (!m->suppress_irq && ((m->irq_at && m->hardware_ticks >= m->irq_at) ||
++	    (!m->irq_at && all_responded))) { m->reg[FAJITA_RPMH_IRQ_STATUS / 4] |= 1u << m->selected; }
++}
++static void assert_safe_cleanup(const struct mock *m)
++{
++	assert(m->triggered && m->accepted && m->selected < 2);
++	assert(m->reg[slot_offset(m->selected, FAJITA_RPMH_STATUS) / 4] != 0);
++	for (unsigned n = 0; n < 3; n++) {
++		uint32_t status = m->reg[(slot_offset(m->selected, FAJITA_RPMH_CMD_STATUS) +
++		    n * FAJITA_RPMH_CMD_STRIDE) / 4];
++		assert((status & FAJITA_RPMH_COMMAND_OK) == FAJITA_RPMH_COMMAND_OK);
+ 	}
+ }
+ static uint32_t rd(void *ctx, uint32_t offset)
+@@ -67,10 +101,19 @@
+ 	    ++m->mutation_reads == m->mutate_on_read) { m->reg[offset / 4] = m->mutate_value; }
+ 	if (offset == FAJITA_RPMH_IRQ_STATUS && m->triggered && !m->completed) {
+ 		m->irq_polls++;
+-		if (!m->no_completion && m->irq_polls >= m->ready_after) { complete(m); }
+-	}
++	}
++	if (m->triggered && offset == slot_offset(m->selected, FAJITA_RPMH_CMD_STATUS)) { m->command_polls++; }
+ 	uint32_t result = m->reg[offset / 4];
+-	return m->fault_active && offset == m->fault_offset ? result ^ 1u : result;
++	if (m->fault_active && offset == m->fault_offset) { result ^= 1u; }
++	if (m->triggered) {
++		uint32_t first_status = slot_offset(m->selected, FAJITA_RPMH_CMD_STATUS);
++		if (offset == slot_offset(m->selected, FAJITA_RPMH_STATUS) && !result) { m->observed_busy = true; }
++		if (offset >= first_status && (offset - first_status) / FAJITA_RPMH_CMD_STRIDE < 3 &&
++		    (offset - first_status) % FAJITA_RPMH_CMD_STRIDE == 0 &&
++		    (result & FAJITA_RPMH_COMMAND_OK) != FAJITA_RPMH_COMMAND_OK) { m->observed_incomplete = true; }
++		if (offset == FAJITA_RPMH_IRQ_STATUS && (result & (1u << m->selected))) { m->observed_irq = true; }
++	}
++	return result;
+ }
+ static bool command_field(unsigned index, uint32_t offset)
+ {
+@@ -94,7 +137,7 @@
+ 	}
+ 	if (offset == FAJITA_RPMH_IRQ_CLEAR) {
+ 		assert(m->selected < 2 && value == (1u << m->selected));
+-		assert(m->completed && m->reg[slot_offset(m->selected, FAJITA_RPMH_STATUS) / 4]);
++		assert_safe_cleanup(m);
+ 		if (at != m->fail_write_at && !m->ignore_irq_clear) {
+ 			m->reg[FAJITA_RPMH_IRQ_STATUS / 4] &= ~value;
+ 		}
+@@ -108,8 +151,8 @@
+ 		    within == FAJITA_RPMH_CMD_ENABLE || command_field(index, offset));
+ 		if (m->selected == FAJITA_RPMH_NO_TCS) { m->selected = index; }
+ 		assert(m->selected == index);
+-		/* A busy running TCS must never be overwritten, even on timeout. */
+-		assert(!m->triggered || m->completed);
++		/* A partial response or idle engine alone never permits cleanup. */
++		if (m->triggered) { assert_safe_cleanup(m); }
+ 		if (!m->triggered && command_field(index, offset)) {
+ 			/* Both checked quiesce writes precede every first command write.
+ 			 * No command can be overwritten under inherited AMC enable/trigger.
+@@ -140,14 +183,17 @@
+ 			assert(m->reg[(command + FAJITA_RPMH_DATA) / 4] == data[n]);
+ 		}
+ 		m->triggered = true; m->trigger_at = at; m->selected = index;
+-		m->reg[(slot + FAJITA_RPMH_STATUS) / 4] = 0;
++		/* At tick zero acceptance can be immediate, delayed or absent. */
++		hardware_progress(m);
+ 	}
+ }
+ static bool delay_us(void *ctx, unsigned us)
+ {
+ 	struct mock *m = ctx;
+ 	assert(us == 1 || us == 10);
+-	return m->delays++ != m->fail_delay_at;
++	bool success = m->delays++ != m->fail_delay_at;
++	if (success && us == 10 && m->triggered) { m->hardware_ticks++; hardware_progress(m); }
++	return success;
+ }
+ static const struct fajita_rpmh_ops ops = {rd, wr, delay_us};
+ 
+@@ -196,7 +242,7 @@
+ 				assert(fajita_rpmh_avdd_transaction_diagnostic(&ops, &m, RESOURCE, &chosen, &diag) == FAJITA_RPMH_READY);
+ 				assert(diag.reason == FAJITA_RPMH_REASON_NONE && diag.slot == index);
+ 				assert(chosen == index && m.triggered && m.completed && m.irq_polls == polls);
+-				assert(m.delays == polls - 1);
++				assert(m.delays == polls && m.command_polls == polls + 1);
+ 				assert_restored(&m, chosen);
+ 				assert(m.nwrites == 32);
+ 				/* Explicit ordering around trigger and cleanup. */
+@@ -316,13 +362,13 @@
+ 		struct fajita_rpmh_diagnostic diag;
+ 		assert(fajita_rpmh_avdd_transaction_diagnostic(&ops, &m, RESOURCE, &chosen, &diag) == FAJITA_RPMH_FATAL);
+ 		assert(diag.reason == FAJITA_RPMH_REASON_POSTTRIGGER_FATAL && diag.slot == 0);
+-		assert(m.irq_polls == FAJITA_RPMH_COMPLETION_POLLS);
++		assert(m.irq_polls == FAJITA_RPMH_COMPLETION_POLLS && m.command_polls == FAJITA_RPMH_COMPLETION_POLLS);
+ 		assert(m.delays == FAJITA_RPMH_COMPLETION_POLLS - 1);
+ 		assert_inflight_preserved(&m, chosen);
+ 	}
+ 	init(&m); m.ready_after = 2; m.fail_delay_at = 0;
+ 	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_FATAL);
+-	assert(m.delays == 1 && m.irq_polls == 1);
++	assert(m.delays == 1 && m.irq_polls == 1 && m.command_polls == 1);
+ 	assert_inflight_preserved(&m, chosen);
+ 	for (unsigned command = 0; command < 3; command++) {
+ 		static const uint32_t bad[] = {0, 1u << 8, 1u << 16};
+@@ -346,6 +392,121 @@
+ 		assert(!(m.reg[FAJITA_RPMH_IRQ_ENABLE / 4] & (1u << chosen)));
+ 		assert(m.reg[FAJITA_RPMH_IRQ_STATUS / 4] & OTHER_IRQ);
+ 	}
++}
++static void test_completion_without_irq_dependency(void)
++{
++	struct mock m; unsigned chosen; struct fajita_rpmh_diagnostic diag;
++	/* No IRQ status is ever asserted, but all commands and the engine finish. */
++	init(&m); m.suppress_irq = true; m.ready_after = 2;
++	assert(fajita_rpmh_avdd_transaction_diagnostic(&ops, &m, RESOURCE, &chosen, &diag) == FAJITA_RPMH_READY);
++	assert(m.hardware_ticks == 2 && m.command_polls == 3 && m.irq_polls == 2);
++	assert_restored(&m, chosen);
++	/* An early IRQ, early engine idle and first command done must not allow
++	 * cleanup while either of the other two command responses is outstanding.
++	 */
++	init(&m); m.command_done_at[0] = 1; m.command_done_at[1] = 3;
++	m.command_done_at[2] = 4; m.engine_idle_at = 1; m.irq_at = 1;
++	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_READY);
++	assert(m.hardware_ticks == 4 && m.command_polls == 5 && m.irq_polls == 4);
++	assert_restored(&m, chosen);
++	init(&m); m.command_done_at[0] = 1; m.command_done_at[1] = UINT32_MAX;
++	m.command_done_at[2] = UINT32_MAX; m.engine_idle_at = 1; m.irq_at = 1;
++	assert(fajita_rpmh_avdd_transaction_diagnostic(&ops, &m, RESOURCE, &chosen, &diag) == FAJITA_RPMH_FATAL);
++	assert(diag.reason == FAJITA_RPMH_REASON_POSTTRIGGER_FATAL &&
++	    diag.offset == FAJITA_RPMH_CMD_STATUS + FAJITA_RPMH_CMD_STRIDE && !diag.value);
++	assert(m.reg[FAJITA_RPMH_STATUS / 4] && m.reg[FAJITA_RPMH_CMD_STATUS / 4] == FAJITA_RPMH_COMMAND_OK);
++	assert_inflight_preserved(&m, chosen);
++	/* All command responses may precede engine idle; wait, without cleanup. */
++	init(&m); m.engine_idle_at = 4;
++	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_READY);
++	assert(m.hardware_ticks == 4 && m.command_polls == 5);
++	assert_restored(&m, chosen);
++	init(&m); m.keep_busy = true;
++	assert(fajita_rpmh_avdd_transaction_diagnostic(&ops, &m, RESOURCE, &chosen, &diag) == FAJITA_RPMH_FATAL);
++	assert(diag.reason == FAJITA_RPMH_REASON_POSTTRIGGER_FATAL && diag.offset == FAJITA_RPMH_STATUS && !diag.value);
++	assert_inflight_preserved(&m, chosen);
++	/* A late IRQ is likewise not a completion prerequisite. */
++	init(&m); m.irq_at = 8;
++	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_READY);
++	assert(m.hardware_ticks == 1 && !(m.reg[FAJITA_RPMH_IRQ_STATUS / 4] & (1u << chosen)));
++	assert_restored(&m, chosen);
++	/* With immediate acceptance, old flags are replaced before current
++	 * responses arrive. Delayed acceptance is tested separately below.
++	 */
++	init(&m); m.ready_after = 3;
++	for (unsigned n = 0; n < 3; n++) {
++		m.reg[(FAJITA_RPMH_CMD_STATUS + n * FAJITA_RPMH_CMD_STRIDE) / 4] = FAJITA_RPMH_COMMAND_OK;
++	}
++	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_READY);
++	assert(m.hardware_ticks == 3 && m.command_polls == 4);
++	init(&m); m.no_completion = true;
++	for (unsigned n = 0; n < 3; n++) {
++		m.reg[(FAJITA_RPMH_CMD_STATUS + n * FAJITA_RPMH_CMD_STRIDE) / 4] = FAJITA_RPMH_COMMAND_OK;
++	}
++	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_FATAL);
++	assert(!m.reg[FAJITA_RPMH_CMD_STATUS / 4] && m.command_polls == FAJITA_RPMH_COMPLETION_POLLS);
++	assert_inflight_preserved(&m, chosen);
++	/* Exactly the last permitted poll succeeds; one tick later times out. */
++	init(&m); m.ready_after = FAJITA_RPMH_COMPLETION_POLLS - 1;
++	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_READY);
++	assert(m.command_polls == FAJITA_RPMH_COMPLETION_POLLS && m.delays == FAJITA_RPMH_COMPLETION_POLLS - 1);
++	assert_restored(&m, chosen);
++	init(&m); m.ready_after = FAJITA_RPMH_COMPLETION_POLLS;
++	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_FATAL);
++	assert(m.command_polls == FAJITA_RPMH_COMPLETION_POLLS && m.delays == FAJITA_RPMH_COMPLETION_POLLS - 1);
++	assert_inflight_preserved(&m, chosen);
++}
++static void seed_old_completion(struct mock *m)
++{
++	for (unsigned n = 0; n < 3; n++) {
++		m->reg[(FAJITA_RPMH_CMD_STATUS + n * FAJITA_RPMH_CMD_STRIDE) / 4] = FAJITA_RPMH_COMMAND_OK;
++	}
++}
++static void test_completion_freshness(void)
++{
++	struct mock m; unsigned chosen; struct fajita_rpmh_diagnostic diag;
++	/* A posted trigger leaves old 3xOK+idle visible for four polls. Only
++	 * after acceptance do the commands clear, the engine run, and new replies
++	 * arrive. Suppressed IRQ must not prevent progress-witnessed success.
++	 */
++	init(&m); seed_old_completion(&m); m.trigger_accept_at = 4;
++	m.ready_after = 7; m.engine_idle_at = 8; m.suppress_irq = true;
++	assert(fajita_rpmh_avdd_transaction_diagnostic(&ops, &m, RESOURCE, &chosen, &diag) == FAJITA_RPMH_READY);
++	assert(m.accepted && m.hardware_ticks == 8 && m.command_polls == 9);
++	assert(m.observed_busy && m.observed_incomplete && !m.observed_irq);
++	assert_restored(&m, chosen);
++	/* Command progress alone is sufficient even if busy was never visible. */
++	init(&m); seed_old_completion(&m); m.trigger_accept_at = 2;
++	m.ready_after = 4; m.engine_idle_at = 1; m.suppress_irq = true;
++	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_READY);
++	assert(m.hardware_ticks == 4 && !m.observed_busy && m.observed_incomplete && !m.observed_irq);
++	assert_restored(&m, chosen);
++	/* No acceptance: stale OK+idle and unrelated IRQs are not a receipt for
++	 * this request. No cleanup or command rollback is permitted on timeout.
++	 */
++	init(&m); seed_old_completion(&m); m.trigger_accept_at = UINT32_MAX;
++	assert(fajita_rpmh_avdd_transaction_diagnostic(&ops, &m, RESOURCE, &chosen, &diag) == FAJITA_RPMH_FATAL);
++	assert(diag.reason == FAJITA_RPMH_REASON_UNWITNESSED_COMPLETION && diag.slot == 0 &&
++	    diag.offset == FAJITA_RPMH_IRQ_STATUS && diag.value == OTHER_IRQ);
++	assert(!m.accepted && !m.observed_busy && !m.observed_incomplete && !m.observed_irq);
++	assert(m.command_polls == FAJITA_RPMH_COMPLETION_POLLS && m.delays == FAJITA_RPMH_COMPLETION_POLLS - 1);
++	assert_inflight_preserved(&m, chosen);
++	/* A genuinely instantaneous response can expose no busy/incomplete
++	 * sample; a new selected IRQ supplies independent freshness evidence.
++	 */
++	init(&m); seed_old_completion(&m); m.ready_after = 0;
++	assert(fajita_rpmh_avdd_transaction(&ops, &m, RESOURCE, &chosen) == FAJITA_RPMH_READY);
++	assert(m.accepted && !m.hardware_ticks && m.command_polls == 1);
++	assert(!m.observed_busy && !m.observed_incomplete && m.observed_irq);
++	assert_restored(&m, chosen);
++	/* Without either progress or a fresh IRQ, even an actually instant
++	 * completion is unprovable to the caller and must conservatively hold.
++	 */
++	init(&m); seed_old_completion(&m); m.ready_after = 0; m.suppress_irq = true;
++	assert(fajita_rpmh_avdd_transaction_diagnostic(&ops, &m, RESOURCE, &chosen, &diag) == FAJITA_RPMH_FATAL);
++	assert(diag.reason == FAJITA_RPMH_REASON_UNWITNESSED_COMPLETION && m.accepted);
++	assert(!m.observed_busy && !m.observed_incomplete && !m.observed_irq);
++	assert_inflight_preserved(&m, chosen);
+ }
+ static void test_invalid_arguments(void)
+ {
+@@ -426,6 +587,8 @@
+ 	test_posttrigger_failures(); test_cleanup_failures(); test_invalid_arguments();
+ 	test_inflight_resource_conflicts();
+ 	test_idle_control_rejections(); test_diagnostics_and_recheck();
+-	puts("RPMh transaction: three idle AMC states, pre-command quiesce, no trigger replay, guards, diagnostics, rollback and fatal paths passed");
++	test_completion_without_irq_dependency();
++	test_completion_freshness();
++	puts("RPMh transaction: idle states, guards, fresh all-command completion, posted triggers, optional IRQ, engine idle, rollback and fatal paths passed");
+ 	return 0;
+ }
+--- a/tests/test-fajita-touch-rpmh.py
++++ b/tests/test-fajita-touch-rpmh.py
+@@ -24,7 +24,7 @@
+     "fp_read": "return mock_read(pa);",
+     "fp_write": "mock_write(pa, value);",
+     "fp_frequency": "return frequency;",
+-    "fp_counter": "if (!stopped) ticks += 192; return ticks;",
++    "fp_counter": "if (!stopped) ticks += 192; mock_advance(); return ticks;",
+     "fp_daif": "return daif_state;",
+     "fp_mask_interrupts": "assert(tpl_state == 31); daif_state |= 0xc0;",
+     "fp_restore_interrupts": "assert(tpl_state == 4); daif_state = daif;",
+@@ -62,7 +62,10 @@
+ static uint32_t table_size, db_pa, geometry;
+ static uint8_t table[512];
+ static uint32_t rsc[0x3000/4], pin[3][2];
+-static bool stopped, no_completion, bad_completion;
++static bool stopped, suppress_completion_irq, no_command_completion, keep_engine_busy, bad_completion;
++static bool deferred_completion, completion_pending;
++static uint64_t completion_at;
++static unsigned incomplete_reads, busy_reads, command_completions;
+ static jmp_buf held;
+ static struct {unsigned pin; bool high; uint64_t at;} gpio_events[32];
+ static unsigned ngpio;
+@@ -93,13 +96,44 @@
+     }
+     return NULL;
+ }
++/* The engine advances only with the independent architectural timer, never
++ * because production chose to read a particular CMD/IRQ/STATUS register. */
++static void mock_advance(void) {
++    if(!completion_pending || ticks<completion_at) return;
++    assert(triggers==1 && selected<2);
++    unsigned slot=selected*FAJITA_RPMH_TCS_STRIDE;
++    if(!no_command_completion&&!bad_completion) {
++        for(unsigned n=0;n<3;n++) {
++            if(ticks>=completion_at+(uint64_t)n*1920) {
++                unsigned at=(slot+FAJITA_RPMH_CMD_STATUS+n*FAJITA_RPMH_CMD_STRIDE)/4;
++                if(rsc[at]!=FAJITA_RPMH_COMMAND_OK) command_completions++;
++                rsc[at]=FAJITA_RPMH_COMMAND_OK;
++            }
++        }
++    }
++    if(ticks>=completion_at+5760) {
++        if(!no_command_completion&&!keep_engine_busy) rsc[(slot+FAJITA_RPMH_STATUS)/4]=1;
++        if(!no_command_completion&&!suppress_completion_irq) rsc[FAJITA_RPMH_IRQ_STATUS/4]|=1u<<selected;
++        completion_pending=false;
++    }
++}
+ static uint32_t mock_read(uint64_t pa) {
+     if(pa==FAJITA_TOUCH_CMD_DB_DICT_PA) return db_pa;
+     if(pa==FAJITA_TOUCH_CMD_DB_DICT_PA+4u) return table_size;
+     if(pa==FAJITA_TOUCH_RSC_CONFIG_PA+0xcu) return geometry;
+     if(pa>=FAJITA_TOUCH_RSC_TCS_PA && pa<FAJITA_TOUCH_RSC_TCS_PA+0x3000u) {
+         assert(tpl_state==31 && (daif_state&0xc0)==0xc0);
+-        return rsc[(pa-FAJITA_TOUCH_RSC_TCS_PA)/4];
++        unsigned off=(unsigned)(pa-FAJITA_TOUCH_RSC_TCS_PA);
++        uint32_t value=rsc[off/4];
++        if(triggers && selected<2) {
++            unsigned slot=selected*FAJITA_RPMH_TCS_STRIDE;
++            if(off==slot+FAJITA_RPMH_STATUS && !value) busy_reads++;
++            for(unsigned n=0;n<3;n++) {
++                if(off==slot+FAJITA_RPMH_CMD_STATUS+n*FAJITA_RPMH_CMD_STRIDE &&
++                   (value&FAJITA_RPMH_COMMAND_OK)!=FAJITA_RPMH_COMMAND_OK) incomplete_reads++;
++            }
++        }
++        return value;
+     }
+     unsigned index,off; uint32_t *p=gpio(pa,&index,&off); assert(p);
+     return off ? ((p[1]&2u)|((p[1]&2u)>>1)) : p[0];
+@@ -114,15 +148,26 @@
+         if(off%FAJITA_RPMH_TCS_STRIDE==FAJITA_RPMH_CONTROL && (v&FAJITA_RPMH_TRIGGER)) {
+             selected=off/FAJITA_RPMH_TCS_STRIDE; assert(selected<2); triggers++;
+             assert(!(rsc[FAJITA_RPMH_IRQ_ENABLE/4]&(1u<<selected)));
++            rsc[(selected*FAJITA_RPMH_TCS_STRIDE+FAJITA_RPMH_STATUS)/4]=0;
+             for(unsigned n=0;n<3;n++) {
+                 unsigned cmd=selected*FAJITA_RPMH_TCS_STRIDE+n*FAJITA_RPMH_CMD_STRIDE;
+                 const unsigned data[]={3008,1,7};
+                 assert(rsc[(cmd+FAJITA_RPMH_MSGID)/4]==0x10108);
+                 assert(rsc[(cmd+FAJITA_RPMH_ADDR)/4]==0x40020+n*4);
+                 assert(rsc[(cmd+FAJITA_RPMH_DATA)/4]==data[n]);
+-                rsc[(cmd+FAJITA_RPMH_CMD_STATUS)/4]=bad_completion?0:FAJITA_RPMH_COMMAND_OK;
+-            }
+-            if(!no_completion) rsc[FAJITA_RPMH_IRQ_STATUS/4]|=1u<<selected;
++                /* A new trigger resets every old command-status word. The
++                 * deferred model exposes the reset before fresh completion. */
++                rsc[(cmd+FAJITA_RPMH_CMD_STATUS)/4]=(deferred_completion||no_command_completion||bad_completion)?0:FAJITA_RPMH_COMMAND_OK;
++            }
++            if(deferred_completion) {
++                completion_pending=true;completion_at=ticks+1920;
++            }
++            if(!deferred_completion&&!no_command_completion&&!keep_engine_busy) {
++                rsc[(selected*FAJITA_RPMH_TCS_STRIDE+FAJITA_RPMH_STATUS)/4]=1;
++            }
++            if(!deferred_completion&&!suppress_completion_irq&&!no_command_completion) {
++                rsc[FAJITA_RPMH_IRQ_STATUS/4]|=1u<<selected;
++            }
+         }
+         return;
+     }
+@@ -141,7 +186,9 @@
+     geometry=(8u<<(6*FAJITA_TOUCH_RSC_DRV_ID))|(3u<<27);
+     tpl_state=4; daif_state=0x100;frequency=19200000;ticks=0;
+     raises=restores=writes=gpio_writes=rsc_writes=maps=triggers=ngpio=clean_calls=held_panel_calls=0;
+-    log_len=0;screen_quiet=0;stopped=no_completion=bad_completion=false;PLAT=&platform_fajita;
++    incomplete_reads=busy_reads=command_completions=0;completion_at=0;
++    deferred_completion=completion_pending=false;
++    log_len=0;screen_quiet=0;stopped=suppress_completion_irq=no_command_completion=keep_engine_busy=bad_completion=false;PLAT=&platform_fajita;
+     rsc[FAJITA_RPMH_STATUS/4]=1;rsc[(FAJITA_RPMH_TCS_STRIDE+FAJITA_RPMH_STATUS)/4]=1;
+     rsc[FAJITA_RPMH_IRQ_ENABLE/4]=0x103;
+     SCREEN.base=(uintptr_t)framebuffer;SCREEN.width=64;SCREEN.height=32;SCREEN.stride=256;
+@@ -197,14 +244,36 @@
+     assert(gpio_events[2].high && !gpio_events[3].high && gpio_events[4].high);
+     assert(ticks-gpio_events[5].at>=1920000 && pin[2][0]==0x1c3);
+     assert(rsc[FAJITA_RPMH_IRQ_ENABLE/4]==0x103 && rsc[FAJITA_RPMH_CONTROL/4]==0);
++    init();suppress_completion_irq=deferred_completion=true;
++    /* Seed stale success before the trigger. The timer-driven mock clears it
++     * on trigger, then completes three commands and the engine independently. */
++    for(unsigned n=0;n<3;n++) rsc[(FAJITA_RPMH_CMD_STATUS+n*FAJITA_RPMH_CMD_STRIDE)/4]=FAJITA_RPMH_COMMAND_OK;
++    assert(fajita_touch_prepare_before_handoff(on,0,0x700)==1);
++    assert(triggers==1 && fajita_power_status==1 && ngpio==6 && tpl_state==4 && daif_state==0x100);
++    assert(rsc[FAJITA_RPMH_IRQ_STATUS/4]==0 && rsc[FAJITA_RPMH_IRQ_ENABLE/4]==0x103);
++    assert(incomplete_reads>0 && command_completions==3 && !completion_pending);
++    /* Without an observable busy/incomplete interval or completion IRQ, an
++     * instantaneous all-OK sample cannot establish that this request ran. */
++    init();suppress_completion_irq=true;
++    if(!setjmp(held)) { (void)fajita_touch_prepare_before_handoff(on,0,0x700);assert(false); }
++    assert(triggers==1 && restores==0 && tpl_state==31 && (daif_state&0xc0)==0xc0);
++    assert(ngpio==1 && screen_quiet && !(rsc[FAJITA_RPMH_IRQ_ENABLE/4]&1u));
++    assert(!incomplete_reads && !busy_reads && rsc[FAJITA_RPMH_IRQ_STATUS/4]==0);
++    assert(rsc_writes==16 && rsc[FAJITA_RPMH_CONTROL/4]==(FAJITA_RPMH_ENABLE|FAJITA_RPMH_TRIGGER));
++    assert(rsc[FAJITA_RPMH_CMD_ENABLE/4]==7 && rsc[FAJITA_RPMH_WAIT/4]==7 && rsc[FAJITA_RPMH_STATUS/4]==1);
++    for(unsigned n=0;n<3;n++) assert(rsc[(FAJITA_RPMH_CMD_STATUS+n*FAJITA_RPMH_CMD_STRIDE)/4]==FAJITA_RPMH_COMMAND_OK);
++    assert((fajita_power_rpmh_detail>>56)==FAJITA_RPMH_REASON_UNWITNESSED_COMPLETION);
++    assert(FAJITA_RPMH_REASON_UNWITNESSED_COMPLETION==8);
++    assert(strstr(log_buf,"handoff HELD") && clean_calls==2 && held_panel_calls==1);
++    assert(framebuffer[64*16]==0x00ff0000 && framebuffer[64*16-1]==0);
+     init();daif_state=0x3c0;rsc[FAJITA_RPMH_STATUS/4]=0;
+     rsc[FAJITA_RPMH_CMD_ENABLE/4]=1;rsc[FAJITA_RPMH_ADDR/4]=0x70000;
+     assert(fajita_touch_prepare_before_handoff(on,0,0x700)==1 && selected==1 && daif_state==0x3c0);
+     init();rsc[FAJITA_RPMH_STATUS/4]=0;rsc[FAJITA_RPMH_CMD_ENABLE/4]=1u<<15;
+     rsc[(FAJITA_RPMH_ADDR+15*FAJITA_RPMH_CMD_STRIDE)/4]=0x40028;
+     assert(!fajita_touch_prepare_before_handoff(on,0,0x700));assert(!rsc_writes && !triggers && restores==1);
+-    for(unsigned mode=0;mode<2;mode++) {
+-        init();no_completion=mode==0;bad_completion=mode==1;
++    for(unsigned mode=0;mode<3;mode++) {
++        init();no_command_completion=mode==0;bad_completion=mode==1;keep_engine_busy=mode==2;
+         if(!setjmp(held)) { (void)fajita_touch_prepare_before_handoff(on,0,0x700);assert(false); }
+         assert(triggers==1 && restores==0 && tpl_state==31 && (daif_state&0xc0)==0xc0);
+         assert(ngpio==1 && screen_quiet && !(rsc[FAJITA_RPMH_IRQ_ENABLE/4]&1u));

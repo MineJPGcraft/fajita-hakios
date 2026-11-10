@@ -1,1 +1,1 @@
--v bootcpu=7 cpus=1 ufs=2 root_apfs=ufs_darwin vtimer_intid=19
+bootcpu=7 cpus=1 ufs=2 root_apfs=ufs_darwin vtimer_intid=19 fajita_touch=1 fajita_touch_power=1 fajita_touch_diag=1 fajita_touch_delay_ms=30000 fajita_touch_panel=1 touch_lat=1

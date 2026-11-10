@@ -1,0 +1,36 @@
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -2343,6 +2343,7 @@
+ 	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
+ 	int64_t status;
+ 	int arrived = 0, watching_only = 0;
++	int saved_screen_quiet = screen_quiet;
+ 
+ 	running_live = live;
+ 	running_slide = slide;
+@@ -2424,6 +2425,8 @@
+ 			arrived = other_cpu_stage != 0;
+ 			if (arrived && PLAT->no_log_write) {
+ 				print("handoff: secondary core reached the entry stub\n");
++				/* XNU now owns the framebuffer; keep later progress in memory. */
++				screen_quiet = 1;
+ 			}
+ 			if (!arrived && seconds_since(started) >= START_SECONDS) {
+ 				status = OTHER_CPU_NOT_STARTED;
+@@ -2474,6 +2477,7 @@
+ 		}
+ 	}
+ 	running_live = NULL;
++	screen_quiet = saved_screen_quiet;
+ 
+ 	if (watching_only) {
+ 		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
+@@ -2563,6 +2567,8 @@
+ static void EFIAPI
+ exception_handler(int64_t type, uint64_t *ctx)
+ {
++	/* An exception report must remain visible after the desktop handoff. */
++	screen_quiet = 0;
+ 	print("\nUEFI EXCEPTION type=%d elr=%x esr=%x far=%x lr=%x sp=%x spsr=%x\n", (uint64_t)type, ctx[EXC_CTX_ELR],
+ 	    ctx[EXC_CTX_ESR], ctx[EXC_CTX_FAR], ctx[EXC_CTX_LR], ctx[EXC_CTX_SP], ctx[EXC_CTX_SPSR]);
+ 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,

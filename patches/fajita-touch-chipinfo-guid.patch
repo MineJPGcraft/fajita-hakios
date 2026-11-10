@@ -1,0 +1,257 @@
+diff --git a/devices/fajita/loader/fajita_touch_rpmh.inc b/devices/fajita/loader/fajita_touch_rpmh.inc
+--- a/devices/fajita/loader/fajita_touch_rpmh.inc
++++ b/devices/fajita/loader/fajita_touch_rpmh.inc
+@@ -17,6 +17,9 @@
+  * Does not change the firmware acknowledgement or authorize kernel access. */
+ static uint32_t fajita_power_status;
+ static uint32_t fajita_power_tlmm_layout;
++/* Low sixteen P bits explain the chip metadata gate. Zero is reserved for
++ * an unspecified failure; 1..8 identify the exact rejected query step. */
++static uint32_t fajita_power_chip_detail;
+ /* reason[63:56], slot[55:48], offset[47:32], observed value[31:0].
+  * Diagnostic only; never authorizes the kernel prepared gate. */
+ static uint64_t fajita_power_rpmh_detail;
+@@ -114,17 +117,28 @@
+  * silicon must leave touch disabled rather than probe alternative tiles. */
+ static uint32_t fp_chip_layout(void)
+ {
+-	static const efi_guid guid = { 0x61224fbe, 0xb240, 0x4d53,
+-	    { 0xb6, 0x61, 0xa9, 0xa1, 0xf3, 0x43, 0xb0, 0x5c } };
++	/* The header macro is stale in this BSP. Use the protocol actually
++	 * declared in its QcomPkg.dec and installed by its ChipInfo.efi. */
++	static const efi_guid guid = { 0xb0760469, 0x970c, 0x487a,
++	    { 0xa4, 0xb5, 0x28, 0xdb, 0x7b, 0x45, 0xce, 0xf1 } };
+ 	struct fajita_chipinfo_protocol *chip = NULL;
+ 	uint32_t id = 0, version = 0;
+-	if (!BS->locate_protocol ||
+-	    EFI_ERROR(BS->locate_protocol(&guid, NULL, (void **)&chip)) || !chip ||
+-	    chip->revision < 0x10000u || (chip->revision >> 16) != 1u ||
+-	    !chip->get_chip_version || !chip->get_chip_id) { return 0; }
+-	if (EFI_ERROR(chip->get_chip_id(chip, &id)) ||
+-	    EFI_ERROR(chip->get_chip_version(chip, &version))) { return 0; }
++	fajita_power_chip_detail = 0;
++	if (!BS->locate_protocol) { fajita_power_chip_detail = 1; return 0; }
++	if (EFI_ERROR(BS->locate_protocol(&guid, NULL, (void **)&chip))) {
++		fajita_power_chip_detail = 2; return 0;
++	}
++	if (!chip) { fajita_power_chip_detail = 3; return 0; }
++	if (chip->revision < 0x10000u || (chip->revision >> 16) != 1u) {
++		fajita_power_chip_detail = 4; return 0;
++	}
++	if (!chip->get_chip_version || !chip->get_chip_id) {
++		fajita_power_chip_detail = 5; return 0;
++	}
++	if (EFI_ERROR(chip->get_chip_id(chip, &id))) { fajita_power_chip_detail = 6; return 0; }
++	if (EFI_ERROR(chip->get_chip_version(chip, &version))) { fajita_power_chip_detail = 7; return 0; }
+ 	uint32_t layout = fajita_touch_layout_for_chip(id, version);
++	if (!layout) { fajita_power_chip_detail = 8; }
+ 	print("fajita-power: chip %x version %x, TLMM layout %d\n",
+ 	    (uint64_t)id, (uint64_t)version, (uint64_t)layout);
+ 	return layout;
+@@ -233,6 +247,7 @@
+ 	unsigned cleanup = 0;
+ 	fajita_power_status = 0;
+ 	fajita_power_tlmm_layout = 0;
++	fajita_power_chip_detail = 0;
+ 	fajita_power_rpmh_detail = 0;
+ 	if (PLAT != &platform_fajita || !fp_arg(line, "fajita_touch=") ||
+ 	    !fp_arg(line, "fajita_touch_power=")) { return 0; }
+@@ -246,7 +261,7 @@
+ 	}
+ 	ctx.tlmm_layout = fp_chip_layout();
+ 	if (!ctx.tlmm_layout) {
+-		fajita_power_status = 0x80080000u;
++		fajita_power_status = 0x80080000u | (fajita_power_chip_detail & 0xffffu);
+ 		print("fajita-power: unknown chip/TLMM layout; touch skipped before MMIO\n");
+ 		return 0;
+ 	}
+diff --git a/devices/fajita/loader/fajita_chipinfo.h b/devices/fajita/loader/fajita_chipinfo.h
+--- a/devices/fajita/loader/fajita_chipinfo.h
++++ b/devices/fajita/loader/fajita_chipinfo.h
+@@ -1,6 +1,8 @@
+ /* SPDX-License-Identifier: GPL-2.0-only
+  * Minimal stable EFIChipInfo protocol prefix, following the local Qualcomm
+- * EFIChipInfo.h. This queries identity/version only; no PMIC protocol.
++ * EFIChipInfo.h. The GUID must come from the built BSP's QcomPkg.dec and
++ * ChipInfo.efi: this BSP's header macro names a different, absent GUID.
++ * This queries identity/version only; no PMIC protocol.
+  */
+ #ifndef FAJITA_CHIPINFO_H
+ #define FAJITA_CHIPINFO_H
+diff --git a/scripts/verify-fajita-source.py b/scripts/verify-fajita-source.py
+--- a/scripts/verify-fajita-source.py
++++ b/scripts/verify-fajita-source.py
+@@ -2,6 +2,7 @@
+ """Check fajita boot ordering, payload reservation and UFS handoff before building."""
+ import argparse
+ import re
++import struct
+ from pathlib import Path
+ 
+ 
+@@ -76,12 +77,30 @@
+     if 'n + str_len(ack) + 1 > BOOT_LINE_LENGTH' not in loader:
+         raise SystemExit("touch acknowledgement requires a command line bound check")
+     power = (args.loader.parent / "fajita_touch_rpmh.inc").read_text()
++    # The BSP's EFIChipInfo.h macro disagrees with its DEC symbol and
++    # installed binary. Check the actual build input, not that stale macro.
++    dec = (args.edk2 / "Silicon/Qualcomm/QcomPkg/QcomPkg.dec").read_text()
++    declared = re.findall(r'^\s*gEfiChipInfoProtocolGuid\s*=\s*(\{[^\n]+\})', dec, re.M)
++    requested = re.findall(r'static const efi_guid guid\s*=\s*(\{[^;]+\})\s*;', power)
++    if len(declared) != 1 or len(requested) != 1:
++        raise SystemExit("ChipInfo GUID declarations must be unambiguous")
++    def guid_bytes(value):
++        fields = [int(v, 16) for v in re.findall(r'0x[0-9a-fA-F]+', value)]
++        if len(fields) != 11:
++            raise SystemExit("invalid ChipInfo GUID initializer")
++        return struct.pack('<IHH8B', *fields)
++    chip_guid = guid_bytes(declared[0])
++    if guid_bytes(requested[0]) != chip_guid:
++        raise SystemExit("loader ChipInfo GUID differs from actual BSP DEC symbol")
++    chip_binary = args.edk2 / "Platform/EFI_Binaries/Drivers/sdm845/ChipInfo/ChipInfo.efi"
++    if chip_guid not in chip_binary.read_bytes():
++        raise SystemExit("BSP ChipInfo binary does not contain its declared protocol GUID")
+     for layout in (1, 2):
+         if f'ack = " fajita_touch_prepared=1 fajita_touch_tlmm={layout}";' not in loader:
+             raise SystemExit("final acknowledgement must carry the selected TLMM layout")
+     if power.index('ctx.tlmm_layout = fp_chip_layout();') > power.index('fp_read(FAJITA_TOUCH_CMD_DB_DICT_PA)'):
+         raise SystemExit("chip layout must be validated before any touch MMIO")
+-    if 'fajita_power_status = 0x80080000u;' not in power:
++    if 'fajita_power_status = 0x80080000u | (fajita_power_chip_detail & 0xffffu);' not in power:
+         raise SystemExit("unknown silicon must skip touch before MMIO")
+     critical = power[power.index('tpl = raise(31);'):power.index('restore(tpl);')]
+     if 'fp_mask_interrupts();' not in critical or 'fp_hold(ctx->tcs);' not in critical or 'print(' in critical:
+diff --git a/tests/test-fajita-chipinfo.py b/tests/test-fajita-chipinfo.py
+--- a/tests/test-fajita-chipinfo.py
++++ b/tests/test-fajita-chipinfo.py
+@@ -1,12 +1,42 @@
+ #!/usr/bin/env python3
+-"""Run the real metadata query and compare its ABI to Qualcomm's header."""
++"""Check the real metadata query against staged ABI and built GUID evidence."""
+ import os
+ from pathlib import Path
++import re
++import struct
+ import subprocess
++import uuid
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ OUT = ROOT / ".work/tests/fajita-chipinfo"
+ OUT.mkdir(parents=True, exist_ok=True)
++EDK2 = ROOT / "ref/dipper-xnu/work/edk2"
++QCOM = EDK2 / "Silicon/Qualcomm/QcomPkg"
++# EDK2 resolves gEfiChipInfoProtocolGuid from QcomPkg.dec. The standalone
++# EFI_CHIPINFO_PROTOCOL_GUID header macro is a different, stale value and
++# must not serve as both the implementation's input and the mock's oracle.
++declaration = re.search(
++    r"^\s*gEfiChipInfoProtocolGuid\s*=\s*(\{[^\n]+\})\s*$",
++    (QCOM / "QcomPkg.dec").read_text(), re.MULTILINE)
++assert declaration, "staged QcomPkg.dec has no ChipInfo protocol declaration"
++guid_words = [int(value, 16) for value in re.findall(r"0x[0-9a-fA-F]+", declaration[1])]
++assert len(guid_words) == 11, "malformed staged ChipInfo GUID declaration"
++actual_guid_bytes = struct.pack("<IHH8B", *guid_words)
++actual_guid = uuid.UUID(bytes_le=actual_guid_bytes)
++assert str(actual_guid).upper() == "B0760469-970C-487A-A4B5-28DB7B45CEF1"
++xref = EDK2 / "workspace/Build/fajita/RELEASE_CLANG38/FV/Guid.xref"
++xref_guids = [line.split()[0] for line in xref.read_text().splitlines()
++              if len(line.split()) == 2 and line.split()[1] == "gEfiChipInfoProtocolGuid"]
++assert len(xref_guids) == 1 and uuid.UUID(xref_guids[0]) == actual_guid, \
++    "built FV GUID reference differs from staged QcomPkg.dec"
++driver = EDK2 / "Platform/EFI_Binaries/Drivers/sdm845/ChipInfo/ChipInfo.efi"
++driver_bytes = driver.read_bytes()
++assert actual_guid_bytes in driver_bytes, "actual SDM845 ChipInfo driver lacks .dec protocol GUID"
++old_guid_bytes = uuid.UUID("61224FBE-B240-4D53-B661-A9A1F343B05C").bytes_le
++assert old_guid_bytes not in driver_bytes, "stale header GUID unexpectedly exists in actual driver"
++guid_initializer = "{ " + ", ".join(hex(value) for value in guid_words[:3]) + ", { " + \
++    ", ".join(hex(value) for value in guid_words[3:]) + " } }"
++print(f"ChipInfo GUID evidence: staged .dec = built FV Guid.xref = SDM845 ChipInfo.efi: {actual_guid}")
+ source = (ROOT / "devices/fajita/loader/fajita_touch_rpmh.inc").read_text()
+ start = source.index("static uint32_t fp_chip_layout(void)")
+ end = source.index("static bool fp_pin_output(", start)
+@@ -42,6 +72,7 @@
+ static efi_boot_services *BS = &services;
+ static struct fajita_chipinfo_protocol chip;
+ static uint32_t id, version;
++static uint32_t fajita_power_chip_detail;
+ static unsigned locates, ids, versions, prints;
+ static bool locate_error, no_protocol, id_error, version_error;
+ static void print(const char *fmt, ...) { assert(strstr(fmt,"TLMM layout")); prints++; }
+@@ -56,7 +87,7 @@
+     *out = version; return 0;
+ }
+ static efi_status locate(const efi_guid *guid, void *registration, void **out) {
+-    const efi_guid expected = EFI_CHIPINFO_PROTOCOL_GUID;
++    const efi_guid expected = ACTUAL_GUID_FROM_STAGED_DEC;
+     assert(!memcmp(guid,&expected,sizeof(expected)) && registration == NULL);
+     locates++;
+     if (locate_error) return EFI_ERROR_BIT | 14;
+@@ -68,9 +99,12 @@
+     chip.get_chip_id=get_id; chip.get_chip_version=get_version;
+     id=321; version=EFI_CHIPINFO_VERSION(2,1);
+     locates=ids=versions=prints=0;
++    /* A fresh query must reset a prior failure, including on success. */
++    fajita_power_chip_detail=UINT32_MAX;
+     locate_error=no_protocol=id_error=version_error=false;
+ }
+ '''
++harness = harness.replace("ACTUAL_GUID_FROM_STAGED_DEC", guid_initializer)
+ tests = r'''
+ int main(void) {
+     const uint32_t versions_to_test[]={0,0x10000,0x10001,0x20000,0x20001,0x20002,0x30000,UINT32_MAX};
+@@ -82,33 +116,54 @@
+         if(id==321 && version==0x10000) expected=1;
+         if(id==321 && (version==0x20000 || version==0x20001)) expected=2;
+         assert(fp_chip_layout()==expected);
++        assert(fajita_power_chip_detail==(expected?0u:8u));
+         assert(locates==1 && ids==1 && versions==1 && prints==1);
+     }
+     reset(); services.locate_protocol=NULL;
+     assert(!fp_chip_layout() && !locates && !ids && !versions);
++    assert(fajita_power_chip_detail==1);
+     reset(); locate_error=true; assert(!fp_chip_layout() && locates==1 && !ids && !versions);
++    assert(fajita_power_chip_detail==2);
+     reset(); no_protocol=true; assert(!fp_chip_layout() && locates==1 && !ids && !versions);
++    assert(fajita_power_chip_detail==3);
+     const uint64_t invalid_revision[]={0,0xffff,0x20000,UINT64_MAX};
+     for(unsigned i=0;i<sizeof(invalid_revision)/sizeof(invalid_revision[0]);i++) {
+         reset();chip.revision=invalid_revision[i];
+         assert(!fp_chip_layout() && !ids && !versions);
++        assert(fajita_power_chip_detail==4);
+     }
+     reset();chip.get_chip_id=NULL; assert(!fp_chip_layout() && !ids && !versions);
++    assert(fajita_power_chip_detail==5);
+     reset();chip.get_chip_version=NULL; assert(!fp_chip_layout() && !ids && !versions);
++    assert(fajita_power_chip_detail==5);
+     reset();id_error=true; assert(!fp_chip_layout() && ids==1 && !versions && !prints);
++    assert(fajita_power_chip_detail==6);
+     reset();version_error=true; assert(!fp_chip_layout() && ids==1 && versions==1 && !prints);
++    assert(fajita_power_chip_detail==7);
++    /* Exercise consecutive calls without reset(): success clears failure,
++     * and a later failure replaces (rather than preserves) old success. */
++    version_error=false;
++    assert(fp_chip_layout()==2 && fajita_power_chip_detail==0);
++    id=320;
++    assert(!fp_chip_layout() && fajita_power_chip_detail==8);
++    id=321;version=0x10000;
++    assert(fp_chip_layout()==1 && fajita_power_chip_detail==0);
++    locate_error=true;
++    assert(!fp_chip_layout() && fajita_power_chip_detail==2);
++    locate_error=false;version=0x20000;
++    assert(fp_chip_layout()==2 && fajita_power_chip_detail==0);
+     assert(fajita_touch_gpio_pa(1,88)==0x03d58000 && fajita_touch_gpio_pa(2,88)==0x03558000);
+     assert(fajita_touch_gpio_pa(1,125)==0x0397d000 && fajita_touch_gpio_pa(2,125)==0x0357d000);
+     assert(!fajita_touch_gpio_pa(0,88) && !fajita_touch_gpio_pa(3,88));
+     assert(!fajita_touch_gpio_pa(1,0) && !fajita_touch_gpio_pa(2,150));
+-    puts("ChipInfo: real Qualcomm ABI/GUID/ID, known revisions, query failures and no default tile passed");
++    puts("ChipInfo: staged Qualcomm ABI, independent .dec/FV/driver GUID, real ID, known revisions, failure reasons, repeated-query reset and no default tile passed");
+ }
+ '''
+ path = OUT / "chipinfo.c"
+ path.write_text(harness + "\n" + query + "\n" + tests)
+ includes = [ROOT / "devices/fajita/kernel", ROOT / "devices/fajita/loader",
+             ROOT / "ref/dipper-xnu/work/hackios/xnuloader",
+-            ROOT / "ref/edk2-sdm845/Silicon/Qualcomm/QcomPkg/Include/Protocol"]
++            QCOM / "Include/Protocol"]
+ binary = OUT / "chipinfo"
+ subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1",
+                 "-fsanitize=address,undefined", "-fno-omit-frame-pointer",

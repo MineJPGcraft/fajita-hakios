@@ -1,0 +1,198 @@
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -11,6 +11,8 @@
+  */
+ #include "efi.h"
+ #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
++#include "fajita_touch_live.h"
++#include "fajita_log_tail.h"
+ 
+ /* ------------------------------------------------------------------------ */
+ /* Fixed conventions shared with the boot shim, the packer and the kernel   */
+@@ -168,6 +170,8 @@
+  * the screen is left to the kernel (and to "oem screenshot").
+  */
+ static int screen_quiet;
++static int fajita_touch_diag_requested;
++static uint64_t live_kernel_lo, live_kernel_hi;
+ 
+ static void
+ put_char(char c)
+@@ -949,7 +953,12 @@
+ 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
+ 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
+ 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
++	uint64_t magic3, size;          /* append-only fajita diagnostic extension */
++	uint64_t touch_live;
+ };
++_Static_assert(__builtin_offsetof(struct kernel_live, sound) == 88, "preserve kernel live ABI");
++_Static_assert(__builtin_offsetof(struct kernel_live, magic3) == 96, "append diagnostics after old ABI");
++_Static_assert(sizeof(struct kernel_live) == 120, "paired kernel live size");
+ 
+ /*
+  * Battery state shared with XNU.  Qualcomm's charger firmware remains a UEFI
+@@ -2278,31 +2287,111 @@
+ 	    (uint64_t)charger_shared.charger_action);
+ }
+ 
++static int
++live_range_contains(uint64_t address, uint64_t bytes)
++{
++	return live_kernel_hi >= live_kernel_lo && address >= live_kernel_lo &&
++	    address <= live_kernel_hi && bytes <= live_kernel_hi - address;
++}
++
+ /* For the record: how much the kernel on the other core has logged so far, and the end of it. */
+ static void
+ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t seconds)
+ {
+-	const char *log;
+-	uint32_t len, from;
++	const volatile char *log;
++	uint32_t len = 0, ring_at, after, wrapped;
++	struct fajita_log_span spans[2];
++	int count = -1;
+ 
+ 	if (live == NULL) {
+ 		print("%d s\n", seconds);
+ 		return;
+ 	}
+-	log = (const char *)(live->log + slide);
+-	/* its first words are written with the caches off: look at memory */
+-	flush_dcache(live->log_len + slide, live->log_len + slide + 4);
+-	len = *(volatile uint32_t *)(live->log_len + slide);
+-	if (len > live->log_head + live->log_ring) {
+-		len = 0;
+-	}
+-	from = len > 240 ? len - 240 : 0;
+-	flush_dcache((uint64_t)(uintptr_t)log + from, (uint64_t)(uintptr_t)log + len);
++	if (!live_range_contains((uint64_t)(uintptr_t)live, 96) ||
++	    !live_range_contains(live->log_len + slide, 4) ||
++	    !live_range_contains(live->log_ring_at + slide, 4) ||
++	    !live_range_contains(live->log_wrapped + slide, 1) ||
++	    live->log_head > UINT64_MAX - live->log_ring ||
++	    !live_range_contains(live->log + slide, live->log_head + live->log_ring)) {
++		print("log tail unavailable: invalid live pointer/range\n"); return;
++	}
++	log = (const volatile char *)(live->log + slide);
++	/* A wrapped writer leaves log_len fixed. The live tail follows ring_at,
++	 * not the physical end of the allocation. Retry a changing snapshot. */
++	for (int attempt = 0; attempt < 3; attempt++) {
++		flush_dcache(live->log_ring_at + slide, live->log_ring_at + slide + 4);
++		ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
++		flush_dcache(live->log_len + slide, live->log_len + slide + 4);
++		len = *(volatile uint32_t *)(live->log_len + slide);
++		flush_dcache(live->log_wrapped + slide, live->log_wrapped + slide + 1);
++		wrapped = *(volatile uint8_t *)(live->log_wrapped + slide);
++		flush_dcache(live->log_ring_at + slide, live->log_ring_at + slide + 4);
++		after = *(volatile uint32_t *)(live->log_ring_at + slide);
++		if (after != ring_at) { continue; }
++		count = fajita_log_tail_spans(live->log_head, live->log_ring, len, ring_at, wrapped, 240, spans);
++		if (count >= 0) { break; }
++	}
+ 	print("%d s: the kernel has logged %d bytes, heartbeat %d; the last of it:\n", seconds, (uint64_t)len, live->heartbeat);
+-	for (uint32_t i = from; i < len; i++) {
+-		put_char(log[i] >= 0x20 && log[i] < 0x7f ? log[i] : log[i] == '\n' ? '\n' : '.');
++	if (count < 0) { print("log tail unavailable: metadata changed\n"); return; }
++	for (int s = 0; s < count; s++) {
++		flush_dcache((uint64_t)(uintptr_t)log + spans[s].offset,
++		    (uint64_t)(uintptr_t)log + spans[s].offset + spans[s].length);
++		for (uint64_t i = 0; i < spans[s].length; i++) {
++			char c = log[spans[s].offset + i];
++			put_char(c >= 0x20 && c < 0x7f ? c : c == '\n' ? '\n' : '.');
++		}
+ 	}
+ 	print("\n");
++}
++
++static const char *
++touch_phase_name(uint32_t phase)
++{
++	switch (phase) {
++	case FT_PHASE_DISABLED: return "disabled/not-entered";
++	case FT_PHASE_INIT: return "init";
++	case FT_PHASE_DEFERRED_ARMED: return "deferred-armed";
++	case FT_PHASE_CREATE_THREAD: return "create-thread";
++	case FT_PHASE_THREAD_ENTERED: return "thread-entered";
++	case FT_PHASE_BEFORE_MAPPING: return "before-mapping";
++	case FT_PHASE_MAP_GPIO: return "map-gpio";
++	case FT_PHASE_SNAPSHOT_GPIO: return "snapshot-gpio";
++	case FT_PHASE_PINMUX: return "pinmux";
++	case FT_PHASE_TLMM_READ: return "TLMM-read";
++	case FT_PHASE_TLMM_WRITE: return "TLMM-write";
++	case FT_PHASE_PAGE_ZERO: return "page-zero";
++	case FT_PHASE_PDT: return "PDT";
++	case FT_PHASE_CONFIGURE_SCAN: return "configure-scan";
++	case FT_PHASE_SCANNING: return "scanning";
++	case FT_PHASE_STOPPED: return "stopped";
++	case FT_PHASE_SKIPPED: return "skipped";
++	default: return "unknown";
++	}
++}
++
++static void
++note_touch_progress(const struct kernel_live *live, uint64_t slide, uint64_t seconds)
++{
++	uint64_t pa, state;
++	const volatile struct fajita_touch_live *touch;
++	if (live == NULL) { return; }
++	if (!live_range_contains((uint64_t)(uintptr_t)live, sizeof(*live))) {
++		print("FT: independent state not available\n"); return;
++	}
++	flush_dcache((uint64_t)(uintptr_t)&live->magic3, (uint64_t)(uintptr_t)&live->touch_live + 8);
++	if (live->magic3 != FAJITA_LIVE_MAGIC3 || live->size != sizeof(*live) || live->touch_live == 0) {
++		print("FT: independent state not available\n"); return;
++	}
++	pa = live->touch_live + slide;
++	if ((pa & 63) || !live_range_contains(pa, sizeof(*touch))) { print("FT: invalid state pointer\n"); return; }
++	flush_dcache(pa, pa + sizeof(*touch));
++	touch = (const volatile struct fajita_touch_live *)(uintptr_t)pa;
++	if (touch->magic != FAJITA_TOUCH_LIVE_MAGIC || touch->size != sizeof(*touch)) {
++		print("FT: independent state ABI mismatch\n"); return;
++	}
++	state = touch->state;  /* one naturally aligned 64-bit snapshot */
++	print("FT=%d data=%x %s (%d s)\n", state >> 32, state & 0xffffffffULL,
++	    touch_phase_name((uint32_t)(state >> 32)), seconds);
+ }
+ 
+ /* A call of the firmware's power interface, the way this platform makes them. */
+@@ -2395,7 +2484,13 @@
+ 				if (!arrived) {
+ 					print("%d s: the core has not arrived\n", noted);
+ 				} else {
++					int restore_quiet = screen_quiet;
++					/* Explicit diagnostic only: expose the existing in-memory log
++					 * tail while touch advances through delayed access boundaries. */
++					if (fajita_touch_diag_requested && noted <= 120) { screen_quiet = 0; }
+ 					note_kernel_progress(live, slide, noted);
++					if (fajita_touch_diag_requested && noted <= 120) { note_touch_progress(live, slide, noted); }
++					screen_quiet = restore_quiet;
+ 				}
+ 				if (!PLAT->no_log_write) {
+ 					flush_log();
+@@ -2966,6 +3061,8 @@
+ 		memcpy((void *)(sg->vmaddr + slide), kernel + sg->fileoff, sg->filesize);
+ 	}
+ 	print("kernel loaded at pa %x..%x\n", kern_lo, kern_hi);
++	live_kernel_lo = kern_lo;
++	live_kernel_hi = kern_hi;
+ 	if (rd_resident) {
+ 		print("resident ramdisk at pa %x size %x\n", rd_pa, rd_size);
+ 	} else if (rd_size != 0) {
+@@ -2991,6 +3088,7 @@
+ 	int camera_requested = 0;
+ 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
+ 	gamut_p3 = 0;
++	fajita_touch_diag_requested = 0;
+ 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
+ 	 * loader asked for (the loader stays resident across runs) */
+ 	block_write_requested = 0;
+@@ -3004,6 +3102,8 @@
+ 		    (c[9] == 0 || c[9] == ' ');
+ 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
+ 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
++		fajita_touch_diag_requested |= starts_with(c, "fajita_touch_diag=1") &&
++		    (c == pi.cmdline || c[-1] == ' ') && (c[19] == 0 || c[19] == ' ');
+ 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
+ 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
+ 		    (c[5] == 0 || c[5] == ' ')) {

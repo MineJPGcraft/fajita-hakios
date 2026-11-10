@@ -1,0 +1,56 @@
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -3430,27 +3430,33 @@
+ 	/* --- hand off (UEFI is left resident, see loader_save_ctx) ------------ */
+ 	if (loader_save_ctx() == 0) {
+ 		print("handoff: UEFI context saved, preparing caches\n");
+-		/*
+-		 * On real hardware (under the Qualcomm hypervisor) dirty data-cache
+-		 * lines do not survive the MMU-off round trip. UEFI stays resident,
+-		 * so everything it owns must be written back to RAM first: clean
+-		 * every allocated region in the memory map, then this stack again.
+-		 */
+-		map_size = sizeof(map_buf);
+-		if (!EFI_ERROR(BS->get_memory_map(&map_size, map_buf, &map_key, &desc_size, &desc_ver))) {
+-			for (uint64_t off = 0; off < map_size; off += desc_size) {
+-				efi_memory_descriptor *d = (efi_memory_descriptor *)(map_buf + off);
+-				/* loader/boot-services/runtime code and data, ACPI tables; XNU's own window is handled below */
+-				if (d->phys_start >= win_base && d->phys_start < win_base + win_size) {
+-					continue;
++		/* Only a same-core jump turns off the firmware CPU's MMU/caches.
++		 * On a secondary-core launch UEFI remains resident with its caches
++		 * active; do not walk unrelated firmware-owned memory. The XNU
++		 * window is published below, and run_on_other_cpu() separately
++		 * publishes its bootstrap/context. block_start()/charger_poll()
++		 * already publish their shared mailboxes before this point. */
++		if (kernel_mpidr == this_mpidr) {
++			print("handoff: preserving same-core firmware caches\n");
++			map_size = sizeof(map_buf);
++			if (!EFI_ERROR(BS->get_memory_map(&map_size, map_buf, &map_key, &desc_size, &desc_ver))) {
++				for (uint64_t off = 0; off < map_size; off += desc_size) {
++					efi_memory_descriptor *d = (efi_memory_descriptor *)(map_buf + off);
++					/* loader/boot-services/runtime code and data, ACPI tables; XNU's own window is handled below */
++					if (d->phys_start >= win_base && d->phys_start < win_base + win_size) {
++						continue;
++					}
++					if ((d->type >= 1 && d->type <= 6) || d->type == 9 || d->type == 10) {
++						clean_dcache(d->phys_start, d->phys_start + (d->pages << 12));
++					}
+ 				}
+-				if ((d->type >= 1 && d->type <= 6) || d->type == 9 || d->type == 10) {
+-					clean_dcache(d->phys_start, d->phys_start + (d->pages << 12));
+-				}
+-			}
+-		}
+-		uint64_t sp_now = (uint64_t)(uintptr_t)__builtin_frame_address(0);
+-		clean_dcache(sp_now - 0x2000, sp_now + 0x2000);
++			}
++			uint64_t sp_now = (uint64_t)(uintptr_t)__builtin_frame_address(0);
++			clean_dcache(sp_now - 0x2000, sp_now + 0x2000);
++		} else {
++			print("handoff: secondary-core launch; firmware caches stay active\n");
++		}
++		print("handoff: flushing XNU range %x..%x\n", phys_base, top);
+ 		flush_dcache(phys_base, top);
+ 		print("handoff: cache preparation complete\n");
+ 		if (checkpoint == CHECKPOINT_SELFTEST) {

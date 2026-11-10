@@ -1,0 +1,86 @@
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -2359,6 +2359,20 @@
+ 	clean_dcache((uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_entry + 0x1000);
+ 	clean_dcache((uint64_t)(uintptr_t)loader_ctx, (uint64_t)(uintptr_t)loader_ctx + sizeof(loader_ctx));
+ 
++	/* There is no storage log to preserve on this platform. Do not keep
++	 * firmware IRQ handlers running while XNU takes over its GIC interface.
++	 * UFS uses synchronous block calls, as in the normal watching phase.
++	 * This masks only this CPU's IRQ delivery, not Qualcomm USB hardware. */
++	if (PLAT->no_log_write) {
++		print("handoff: masking firmware-core interrupts before PSCI\n");
++		daif = READ_SYSREG(DAIF);
++		__asm__ volatile ("msr daifset, #0xf" ::: "memory");
++		group1 = READ_SYSREG(S3_0_C12_C12_7);
++		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0) : "memory");
++		watching_only = 1;
++	}
++	print("handoff: requesting PSCI CPU_ON core %x entry %x args %x\n", mpidr,
++	    (uint64_t)(uintptr_t)&other_cpu_entry, boot_args_pa);
+ 	/* the last argument arrives in that core's x0 */
+ 	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
+ 
+@@ -2374,15 +2388,17 @@
+ 		 * what the kernel is seen to do goes there as it happens. That needs UEFI's services,
+ 		 * so until NOTE_SECONDS are over this core keeps its interrupts.
+ 		 */
+-		if (!watching_only && seconds_since(started) >= noted + 2) {
++		if ((!watching_only || PLAT->no_log_write) && seconds_since(started) >= noted + 2) {
+ 			noted = seconds_since(started);
+-			if (PLAT->log_other_cpu) {
++			if (PLAT->log_other_cpu || PLAT->no_log_write) {
+ 				if (!arrived) {
+ 					print("%d s: the core has not arrived\n", noted);
+ 				} else {
+ 					note_kernel_progress(live, slide, noted);
+ 				}
+-				flush_log();
++				if (!PLAT->no_log_write) {
++					flush_log();
++				}
+ 			}
+ 		}
+ 		/*
+@@ -2406,6 +2422,9 @@
+ 		if (!arrived) {
+ 			flush_dcache((uint64_t)(uintptr_t)&other_cpu_stage, (uint64_t)(uintptr_t)&other_cpu_stage + 8);
+ 			arrived = other_cpu_stage != 0;
++			if (arrived && PLAT->no_log_write) {
++				print("handoff: secondary core reached the entry stub\n");
++			}
+ 			if (!arrived && seconds_since(started) >= START_SECONDS) {
+ 				status = OTHER_CPU_NOT_STARTED;
+ 			}
+@@ -2548,6 +2567,15 @@
+ 	    ctx[EXC_CTX_ESR], ctx[EXC_CTX_FAR], ctx[EXC_CTX_LR], ctx[EXC_CTX_SP], ctx[EXC_CTX_SPSR]);
+ 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
+ 	    ctx[EXC_CTX_ELR] - (uint64_t)(uintptr_t)&__ImageBase);
++	/* Without persistent logs, resetting destroys the only fault report.
++	 * Hold the screen instead; this does not recover the underlying fault. */
++	if (PLAT != NULL && PLAT->no_log_write) {
++		__asm__ volatile ("msr daifset, #0xf" ::: "memory");
++		print("-- UEFI fault held: long-press power to reset --\n");
++		for (;;) {
++			__asm__ volatile ("wfe");
++		}
++	}
+ 	flush_log();
+ 	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+ 	for (;;) {
+@@ -3401,6 +3429,7 @@
+ 
+ 	/* --- hand off (UEFI is left resident, see loader_save_ctx) ------------ */
+ 	if (loader_save_ctx() == 0) {
++		print("handoff: UEFI context saved, preparing caches\n");
+ 		/*
+ 		 * On real hardware (under the Qualcomm hypervisor) dirty data-cache
+ 		 * lines do not survive the MMU-off round trip. UEFI stays resident,
+@@ -3423,6 +3452,7 @@
+ 		uint64_t sp_now = (uint64_t)(uintptr_t)__builtin_frame_address(0);
+ 		clean_dcache(sp_now - 0x2000, sp_now + 0x2000);
+ 		flush_dcache(phys_base, top);
++		print("handoff: cache preparation complete\n");
+ 		if (checkpoint == CHECKPOINT_SELFTEST) {
+ 			/* Do not enter the kernel at all: exercise only the return path. */
+ 			jump_to_kernel((uint64_t)(uintptr_t)&loader_return_stub, 0);

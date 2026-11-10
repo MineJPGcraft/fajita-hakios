@@ -1,0 +1,55 @@
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -171,6 +171,7 @@
+  */
+ static int screen_quiet;
+ static int fajita_touch_diag_requested;
++static int fajita_touch_panel_requested;
+ static uint64_t live_kernel_lo, live_kernel_hi;
+ 
+ static void
+@@ -959,6 +960,7 @@
+ _Static_assert(__builtin_offsetof(struct kernel_live, sound) == 88, "preserve kernel live ABI");
+ _Static_assert(__builtin_offsetof(struct kernel_live, magic3) == 96, "append diagnostics after old ABI");
+ _Static_assert(sizeof(struct kernel_live) == 120, "paired kernel live size");
++static void fajita_touch_panel_update(const struct kernel_live *live, uint64_t slide);
+ 
+ /*
+  * Battery state shared with XNU.  Qualcomm's charger firmware remains a UEFI
+@@ -2487,10 +2489,11 @@
+ 					int restore_quiet = screen_quiet;
+ 					/* Explicit diagnostic only: expose the existing in-memory log
+ 					 * tail while touch advances through delayed access boundaries. */
+-					if (fajita_touch_diag_requested && noted <= 120) { screen_quiet = 0; }
++					if (!fajita_touch_panel_requested && fajita_touch_diag_requested && noted <= 120) { screen_quiet = 0; }
+ 					note_kernel_progress(live, slide, noted);
+ 					if (fajita_touch_diag_requested && noted <= 120) { note_touch_progress(live, slide, noted); }
+ 					screen_quiet = restore_quiet;
++					if (fajita_touch_panel_requested) { fajita_touch_panel_update(live, slide); }
+ 				}
+ 				if (!PLAT->no_log_write) {
+ 					flush_log();
+@@ -2956,6 +2959,7 @@
+ static int starts_with(const char *s, const char *prefix);
+ 
+ #include "fajita_touch_rpmh.inc"
++#include "fajita_touch_panel.inc"
+ 
+ static int
+ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3091,6 +3095,7 @@
+ 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
+ 	gamut_p3 = 0;
+ 	fajita_touch_diag_requested = 0;
++	fajita_touch_panel_requested = 0;
+ 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
+ 	 * loader asked for (the loader stays resident across runs) */
+ 	block_write_requested = 0;
+@@ -3129,6 +3134,7 @@
+ 		charger_start();
+ 	}
+ 	int fajita_touch_prepared = fajita_touch_prepare_before_handoff(pi.cmdline, this_mpidr, kernel_mpidr);
++	fajita_touch_panel_requested = PLAT == &platform_fajita && fp_arg(pi.cmdline, "fajita_touch_panel=");
+ 	if (ufs_requested >= 2) {
+ 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
+ 	}

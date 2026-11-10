@@ -1,0 +1,1345 @@
+diff --git a/devices/fajita/kernel/fajita_touch_board.h b/devices/fajita/kernel/fajita_touch_board.h
+--- a/devices/fajita/kernel/fajita_touch_board.h
++++ b/devices/fajita/kernel/fajita_touch_board.h
+@@ -1,13 +1,16 @@
+ /* SPDX-License-Identifier: GPL-2.0-only
+  * Fajita board facts, not a claim of initialized hardware.
+  * Sources: EDL base DTB + fajita overlays 06..12, and OnePlus SDM845
+- * pinctrl-sdm845.c at 222822c2d0042067b7964c6302ef4d756dc4bed9.
++ * pinctrl-sdm845.c / pinctrl-sdm845-v2.c at
++ * 222822c2d0042067b7964c6302ef4d756dc4bed9.
+  * scripts/audit-fajita-touch-dt.py checks these against the raw inputs.
+  * Values are shared by the loader power backend and the kernel transport.
+  * Constants and host tests do not establish successful electrical bring-up.
+  */
+ #ifndef FAJITA_TOUCH_BOARD_H
+ #define FAJITA_TOUCH_BOARD_H
++
++#include <stdint.h>
+ 
+ #define FAJITA_TOUCH_I2C_ADDRESS 32u
+ /* DT verifies the pair gpio49/gpio50 and qup12, but its pins list does not
+@@ -26,9 +29,48 @@
+ 
+ #define FAJITA_TOUCH_SDA_PA 0x03931000u
+ #define FAJITA_TOUCH_SCL_PA 0x03932000u
+-#define FAJITA_TOUCH_IRQ_PA 0x0397d000u
+ #define FAJITA_TOUCH_RESET_PA 0x03963000u
+-#define FAJITA_TOUCH_VDDIO_PA 0x03d58000u
++#define FAJITA_TOUCH_IRQ_V1_PA 0x0397d000u
++#define FAJITA_TOUCH_IRQ_V2_PA 0x0357d000u
++#define FAJITA_TOUCH_VDDIO_V1_PA 0x03d58000u
++#define FAJITA_TOUCH_VDDIO_V2_PA 0x03558000u
++#define FAJITA_TOUCH_CHIP_ID 321u
++#define FAJITA_TOUCH_TLMM_LAYOUT_V1 1u
++#define FAJITA_TOUCH_TLMM_LAYOUT_V2 2u
++
++/* An appended Android DTB bundle contains several silicon revisions, not
++ * several descriptions of one layout. Select using firmware ChipInfo,
++ * BEFORE any touch MMIO. These are the three revisions present in the
++ * extracted DTBs; an unknown ID/version has no safe default address. */
++static inline uint32_t
++fajita_touch_layout_for_chip(uint32_t chip_id, uint32_t version)
++{
++	if (chip_id != FAJITA_TOUCH_CHIP_ID) { return 0; }
++	if (version == 0x00010000u) { return FAJITA_TOUCH_TLMM_LAYOUT_V1; }
++	if (version == 0x00020000u || version == 0x00020001u) {
++		return FAJITA_TOUCH_TLMM_LAYOUT_V2;
++	}
++	return 0;
++}
++
++static inline uint32_t
++fajita_touch_gpio_pa(uint32_t layout, uint32_t gpio)
++{
++	if (layout != FAJITA_TOUCH_TLMM_LAYOUT_V1 &&
++	    layout != FAJITA_TOUCH_TLMM_LAYOUT_V2) { return 0; }
++	switch (gpio) {
++	case FAJITA_TOUCH_SDA_GPIO: return FAJITA_TOUCH_SDA_PA;
++	case FAJITA_TOUCH_SCL_GPIO: return FAJITA_TOUCH_SCL_PA;
++	case FAJITA_TOUCH_RESET_GPIO: return FAJITA_TOUCH_RESET_PA;
++	case FAJITA_TOUCH_IRQ_GPIO:
++		return layout == FAJITA_TOUCH_TLMM_LAYOUT_V1 ?
++		    FAJITA_TOUCH_IRQ_V1_PA : FAJITA_TOUCH_IRQ_V2_PA;
++	case FAJITA_TOUCH_VDDIO_GPIO:
++		return layout == FAJITA_TOUCH_TLMM_LAYOUT_V1 ?
++		    FAJITA_TOUCH_VDDIO_V1_PA : FAJITA_TOUCH_VDDIO_V2_PA;
++	default: return 0;
++	}
++}
+ 
+ /* DT dictionary, not a guessed address of the database itself. */
+ #define FAJITA_TOUCH_CMD_DB_DICT_PA 0x0c3f000cu
+diff --git a/devices/fajita/kernel/fajita_synaptics.c b/devices/fajita/kernel/fajita_synaptics.c
+--- a/devices/fajita/kernel/fajita_synaptics.c
++++ b/devices/fajita/kernel/fajita_synaptics.c
+@@ -243,7 +243,7 @@
+ void fajita_touch_init(void)
+ {
+ 	uint32_t enabled = 0, interval = 0, inherited = 0, diagnostic = 0, startup_delay = 0;
+-	uint32_t power = 0, prepared = 0;
++	uint32_t power = 0, prepared = 0, layout = 0;
+ 	uint64_t deadline;
+ 	if (!PE_parse_boot_argn("fajita_touch", &enabled, sizeof(enabled)) || enabled != 1) { return; }
+ 	if (ft_start_call != NULL) { return; }
+@@ -259,6 +259,15 @@
+ 		loader_log_line("fajita-touch-phase: skipped; firmware preparation failed or inherited probe not requested\n");
+ 		return;
+ 	}
++	/* Firmware and kernel must use the same silicon-specific TLMM tiles.
++	 * This also requires an explicit layout for legacy inherited probes. */
++	PE_parse_boot_argn("fajita_touch_tlmm", &layout, sizeof(layout));
++	if (!fajita_bus_select_layout(layout)) {
++		ft_error = 7;
++		ft_phase(FT_PHASE_SKIPPED, 7);
++		loader_log_line("fajita-touch-phase: skipped; missing or unsupported TLMM layout\n");
++		return;
++	}
+ 	if (PE_parse_boot_argn("fajita_touch_diag", &diagnostic, sizeof(diagnostic)) && diagnostic == 1) {
+ 		ft_diag_enabled = 1;
+ 	}
+diff --git a/devices/fajita/kernel/fajita_touch_transport.inc b/devices/fajita/kernel/fajita_touch_transport.inc
+--- a/devices/fajita/kernel/fajita_touch_transport.inc
++++ b/devices/fajita/kernel/fajita_touch_transport.inc
+@@ -1,6 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0-only
+  * Fajita GPIO I2C transport. GPIO/timing facts: OnePlus SDM845_Q_10.0,
+- * commit 222822c2d0042067b7964c6302ef4d756dc4bed9, pinctrl-sdm845.c and
++ * commit 222822c2d0042067b7964c6302ef4d756dc4bed9, pinctrl-sdm845.c/pinctrl-sdm845-v2.c and
+  * synaptics_driver_s3320.c. Probe inherited power without touching PMIC,
+  * supply or reset GPIOs. No cmd-db, RPMh/TCS, GENI, GCC clock or USB
+  * controller is accessed by this transport.
+@@ -11,9 +11,26 @@
+ static bool ft_bus_owned;
+ static uint32_t ft_transactions;
+ static unsigned ft_wire_error;
+-static const uint64_t ft_pin_pa[FT_PIN_COUNT] = {
+-	FAJITA_TOUCH_SDA_PA, FAJITA_TOUCH_SCL_PA, FAJITA_TOUCH_IRQ_PA
+-};
++/* Layout comes from the firmware's final chip-version acknowledgement.
++ * No revision-sensitive pin address has an implicit v1 default. */
++static uint64_t ft_pin_pa[FT_PIN_COUNT];
++
++static bool fajita_bus_select_layout(uint32_t layout)
++{
++	const unsigned gpio[FT_PIN_COUNT] = {
++		FAJITA_TOUCH_SDA_GPIO, FAJITA_TOUCH_SCL_GPIO, FAJITA_TOUCH_IRQ_GPIO
++	};
++	uint64_t pa[FT_PIN_COUNT];
++	if (ft_bus_owned) { return false; }
++	for (unsigned i = 0; i < FT_PIN_COUNT; i++) {
++		pa[i] = fajita_touch_gpio_pa(layout, gpio[i]);
++	}
++	for (unsigned i = 0; i < FT_PIN_COUNT; i++) {
++		ft_pin_pa[i] = pa[i];
++		ft_pin[i] = 0;
++	}
++	return pa[FT_SDA] != 0 && pa[FT_SCL] != 0 && pa[FT_IRQ] != 0;
++}
+ 
+ static uint32_t ft_gpio_pa(vm_offset_t p)
+ {
+@@ -65,6 +82,10 @@
+ 
+ static bool fajita_bus_init(void)
+ {
++	/* Unknown or absent layout must fail before any mapping or MMIO. */
++	for (unsigned i = 0; i < FT_PIN_COUNT; i++) {
++		if (ft_pin_pa[i] == 0) { return false; }
++	}
+ 	for (unsigned i = 0; i < FT_PIN_COUNT; i++) {
+ 		ft_phase(FT_PHASE_MAP_GPIO, (uint32_t)ft_pin_pa[i]);
+ 		ft_pin[i] = ml_io_map(ft_pin_pa[i], 0x1000);
+diff --git a/devices/fajita/loader/fajita_touch_rpmh.inc b/devices/fajita/loader/fajita_touch_rpmh.inc
+--- a/devices/fajita/loader/fajita_touch_rpmh.inc
++++ b/devices/fajita/loader/fajita_touch_rpmh.inc
+@@ -7,13 +7,16 @@
+ #include "fajita_touch_power_seq.h"
+ #include "fajita_cmd_db.h"
+ #include "fajita_rpmh_transaction.h"
++#include "fajita_chipinfo.h"
+ 
+ struct fajita_power_context {
+ 	uint32_t resource, tcs, rpmh_result;
++	uint32_t tlmm_layout;
+ };
+ /* Diagnostic outcome only. 1=prepared; 0=not requested; 0x800nxxxx=skip.
+  * Does not change the firmware acknowledgement or authorize kernel access. */
+ static uint32_t fajita_power_status;
++static uint32_t fajita_power_tlmm_layout;
+ /* reason[63:56], slot[55:48], offset[47:32], observed value[31:0].
+  * Diagnostic only; never authorizes the kernel prepared gate. */
+ static uint64_t fajita_power_rpmh_detail;
+@@ -107,32 +110,64 @@
+ 	(void)ctx;
+ 	fp_write(FAJITA_TOUCH_RSC_TCS_PA + offset, value);
+ }
++/* Metadata only: no pin, PMIC, RSC or USB operation. Unknown firmware or
++ * silicon must leave touch disabled rather than probe alternative tiles. */
++static uint32_t fp_chip_layout(void)
++{
++	static const efi_guid guid = { 0x61224fbe, 0xb240, 0x4d53,
++	    { 0xb6, 0x61, 0xa9, 0xa1, 0xf3, 0x43, 0xb0, 0x5c } };
++	struct fajita_chipinfo_protocol *chip = NULL;
++	uint32_t id = 0, version = 0;
++	if (!BS->locate_protocol ||
++	    EFI_ERROR(BS->locate_protocol(&guid, NULL, (void **)&chip)) || !chip ||
++	    chip->revision < 0x10000u || (chip->revision >> 16) != 1u ||
++	    !chip->get_chip_version || !chip->get_chip_id) { return 0; }
++	if (EFI_ERROR(chip->get_chip_id(chip, &id)) ||
++	    EFI_ERROR(chip->get_chip_version(chip, &version))) { return 0; }
++	uint32_t layout = fajita_touch_layout_for_chip(id, version);
++	print("fajita-power: chip %x version %x, TLMM layout %d\n",
++	    (uint64_t)id, (uint64_t)version, (uint64_t)layout);
++	return layout;
++}
+ static bool fp_pin_output(uint32_t pa, bool high, uint32_t control)
+ {
+-	fp_write(pa + 4u, high ? 2u : 0u);
+-	fp_write(pa, control | (1u << 9));
+-	return (fp_read(pa) & 0x3ffu) == (control | (1u << 9)) &&
+-	    (fp_read(pa + 4u) & 3u) == (high ? 3u : 0u);
++	/* Only callers with a selected silicon layout may pass one of these
++	 * output pins. Never turn a failed selection into a zero-page access. */
++	if (pa != FAJITA_TOUCH_RESET_PA && pa != FAJITA_TOUCH_VDDIO_V1_PA &&
++	    pa != FAJITA_TOUCH_VDDIO_V2_PA) { return false; }
++	uint32_t desired = (control & 0x3ffu) | (1u << 9);
++	uint32_t io = fp_read(pa + 4u), ctl = fp_read(pa);
++	fp_write(pa + 4u, (io & ~2u) | (high ? 2u : 0u));
++	fp_write(pa, (ctl & ~0x3ffu) | desired);
++	/* Bit 1 is the programmed output latch. Bit 0 is an independent input
++	 * sample, not proof of whether the output register accepted this write. */
++	return (fp_read(pa) & 0x3ffu) == desired &&
++	    (fp_read(pa + 4u) & 2u) == (high ? 2u : 0u);
+ }
+ static bool fp_reset_set(void *ctx, bool high)
+ {
+-	(void)ctx;
++	struct fajita_power_context *power = ctx;
+ 	print("fajita-power: reset %d\n", (uint64_t)high);
+-	return fp_pin_output(FAJITA_TOUCH_RESET_PA, high, 0);
++	return fp_pin_output(fajita_touch_gpio_pa(power->tlmm_layout,
++	    FAJITA_TOUCH_RESET_GPIO), high, 0);
+ }
+ static bool fp_vddio_set(void *ctx, bool high)
+ {
+-	(void)ctx;
++	struct fajita_power_context *power = ctx;
+ 	print("fajita-power: GPIO88 %d\n", (uint64_t)high);
+-	return fp_pin_output(FAJITA_TOUCH_VDDIO_PA, high, 0);
++	return fp_pin_output(fajita_touch_gpio_pa(power->tlmm_layout,
++	    FAJITA_TOUCH_VDDIO_GPIO), high, 0);
+ }
+ static bool fp_active_pins(void *ctx)
+ {
+-	(void)ctx;
++	struct fajita_power_context *power = ctx;
++	uint32_t reset = fajita_touch_gpio_pa(power->tlmm_layout, FAJITA_TOUCH_RESET_GPIO);
++	uint32_t irq = fajita_touch_gpio_pa(power->tlmm_layout, FAJITA_TOUCH_IRQ_GPIO);
++	if (!reset || !irq) { return false; }
+ 	print("fajita-power: active pinctrl\n");
+-	if (!fp_pin_output(FAJITA_TOUCH_RESET_PA, true, FAJITA_TOUCH_ACTIVE_IRQ_CTL)) { return false; }
+-	fp_write(FAJITA_TOUCH_IRQ_PA, FAJITA_TOUCH_ACTIVE_IRQ_CTL);
+-	return (fp_read(FAJITA_TOUCH_IRQ_PA) & 0x3ffu) == FAJITA_TOUCH_ACTIVE_IRQ_CTL;
++	if (!fp_pin_output(reset, true, FAJITA_TOUCH_ACTIVE_IRQ_CTL)) { return false; }
++	fp_write(irq, (fp_read(irq) & ~0x3ffu) | FAJITA_TOUCH_ACTIVE_IRQ_CTL);
++	return (fp_read(irq) & 0x3ffu) == FAJITA_TOUCH_ACTIVE_IRQ_CTL;
+ }
+ static bool fp_avdd_enable(void *opaque, uint32_t uv, uint32_t load)
+ {
+@@ -197,6 +232,7 @@
+ 	};
+ 	unsigned cleanup = 0;
+ 	fajita_power_status = 0;
++	fajita_power_tlmm_layout = 0;
+ 	fajita_power_rpmh_detail = 0;
+ 	if (PLAT != &platform_fajita || !fp_arg(line, "fajita_touch=") ||
+ 	    !fp_arg(line, "fajita_touch_power=")) { return 0; }
+@@ -208,6 +244,13 @@
+ 		fajita_power_status = 0x80020000u;
+ 		print("fajita-power: invalid/stopped architectural timer; touch skipped\n"); return 0;
+ 	}
++	ctx.tlmm_layout = fp_chip_layout();
++	if (!ctx.tlmm_layout) {
++		fajita_power_status = 0x80080000u;
++		print("fajita-power: unknown chip/TLMM layout; touch skipped before MMIO\n");
++		return 0;
++	}
++	fajita_power_tlmm_layout = ctx.tlmm_layout;
+ 	print("fajita-power: reading DT command-database dictionary\n");
+ 	uint32_t pa = fp_read(FAJITA_TOUCH_CMD_DB_DICT_PA);
+ 	uint32_t size = fp_read(FAJITA_TOUCH_CMD_DB_DICT_PA + 4u);
+diff --git a/devices/fajita/loader/fajita_chipinfo.h b/devices/fajita/loader/fajita_chipinfo.h
+new file mode 100644
+--- /dev/null
++++ b/devices/fajita/loader/fajita_chipinfo.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * Minimal stable EFIChipInfo protocol prefix, following the local Qualcomm
++ * EFIChipInfo.h. This queries identity/version only; no PMIC protocol.
++ */
++#ifndef FAJITA_CHIPINFO_H
++#define FAJITA_CHIPINFO_H
++
++struct fajita_chipinfo_protocol {
++	uint64_t revision;
++	efi_status (EFIAPI *get_chip_version)(struct fajita_chipinfo_protocol *, uint32_t *);
++	void *get_raw_chip_version;
++	efi_status (EFIAPI *get_chip_id)(struct fajita_chipinfo_protocol *, uint32_t *);
++};
++_Static_assert(offsetof(struct fajita_chipinfo_protocol, get_chip_version) == 8,
++    "ChipInfo GetChipVersion ABI");
++_Static_assert(offsetof(struct fajita_chipinfo_protocol, get_chip_id) == 24,
++    "ChipInfo GetChipId ABI");
++
++#endif
+diff --git a/scripts/ensure-fajita-touch-rpmh.py b/scripts/ensure-fajita-touch-rpmh.py
+--- a/scripts/ensure-fajita-touch-rpmh.py
++++ b/scripts/ensure-fajita-touch-rpmh.py
+@@ -19,7 +19,7 @@
+     ap.add_argument("--loader", type=Path, required=True)
+     args = ap.parse_args()
+     sources = [ROOT / "devices/fajita/loader" / name for name in
+-               ("fajita_touch_rpmh.inc", "fajita_cmd_db.h", "fajita_rpmh_transaction.h")]
++               ("fajita_touch_rpmh.inc", "fajita_cmd_db.h", "fajita_rpmh_transaction.h", "fajita_chipinfo.h")]
+     sources += [ROOT / "devices/fajita/kernel" / name for name in
+                 ("fajita_touch_board.h", "fajita_touch_power_seq.h")]
+     for source in sources:
+@@ -27,6 +27,20 @@
+         if not target.exists() or target.read_bytes() != source.read_bytes():
+             target.write_bytes(source.read_bytes())
+     text = args.loader.read_text()
++    # Upgrade the exact historical acknowledgement in an already-staged
++    # tree. Fresh and repeated staging still use the same complete block.
++    old_ack = ('const char *ack = fajita_touch_prepared ? " fajita_touch_prepared=1" : " fajita_touch_prepared=0";\n'
++               '\t\tif (n + sizeof(" fajita_touch_prepared=0") > BOOT_LINE_LENGTH) {')
++    new_ack = ('const char *ack = " fajita_touch_prepared=0 fajita_touch_tlmm=0";\n'
++               '\t\tif (fajita_touch_prepared && fajita_power_tlmm_layout == 1) {\n'
++               '\t\t\tack = " fajita_touch_prepared=1 fajita_touch_tlmm=1";\n'
++               '\t\t} else if (fajita_touch_prepared && fajita_power_tlmm_layout == 2) {\n'
++               '\t\t\tack = " fajita_touch_prepared=1 fajita_touch_tlmm=2";\n'
++               '\t\t}\n'
++               '\t\tif (n + str_len(ack) + 1 > BOOT_LINE_LENGTH) {')
++    if text.count(old_ack) > 1:
++        raise SystemExit("duplicate historical touch acknowledgement")
++    text = text.replace(old_ack, new_ack)
+     text = insert_once(text, "static int starts_with(const char *s, const char *prefix);\n",
+                        '\n#include "fajita_touch_rpmh.inc"\n')
+     anchor = '\tif (battery_requested) {\n\t\tcharger_start();\n\t}\n'
+@@ -37,8 +51,13 @@
+     text = insert_once(text, anchor,
+         '\t/* Only this final firmware-produced acknowledgement authorizes touch MMIO. */\n'
+         '\tif (PLAT == &platform_fajita) {\n'
+-        '\t\tconst char *ack = fajita_touch_prepared ? " fajita_touch_prepared=1" : " fajita_touch_prepared=0";\n'
+-        '\t\tif (n + sizeof(" fajita_touch_prepared=0") > BOOT_LINE_LENGTH) {\n'
++        '\t\tconst char *ack = " fajita_touch_prepared=0 fajita_touch_tlmm=0";\n'
++        '\t\tif (fajita_touch_prepared && fajita_power_tlmm_layout == 1) {\n'
++        '\t\t\tack = " fajita_touch_prepared=1 fajita_touch_tlmm=1";\n'
++        '\t\t} else if (fajita_touch_prepared && fajita_power_tlmm_layout == 2) {\n'
++        '\t\t\tack = " fajita_touch_prepared=1 fajita_touch_tlmm=2";\n'
++        '\t\t}\n'
++        '\t\tif (n + str_len(ack) + 1 > BOOT_LINE_LENGTH) {\n'
+         '\t\t\tprint("fajita-power: no room for acknowledgement; refusing handoff\\n");\n'
+         '\t\t\treturn 0;\n\t\t}\n'
+         '\t\tfor (const char *c = ack; *c; c++) { ba->commandLine[n++] = *c; }\n'
+diff --git a/scripts/verify-fajita-source.py b/scripts/verify-fajita-source.py
+--- a/scripts/verify-fajita-source.py
++++ b/scripts/verify-fajita-source.py
+@@ -58,14 +58,14 @@
+                                            'fajita_touch_vreg=')):
+         raise SystemExit("failed firmware touch power experiment must be absent from the loader")
+     for relative in ("loader/fajita_touch_rpmh.inc", "loader/fajita_cmd_db.h",
+-                     "loader/fajita_rpmh_transaction.h", "kernel/fajita_touch_board.h",
++                     "loader/fajita_rpmh_transaction.h", "loader/fajita_chipinfo.h", "kernel/fajita_touch_board.h",
+                      "kernel/fajita_touch_power_seq.h"):
+         source = ROOT / "devices/fajita" / relative
+         if (args.loader.parent / source.name).read_bytes() != source.read_bytes():
+             raise SystemExit(f"stale pre-handoff touch power source: {source.name}")
+     include = '#include "fajita_touch_rpmh.inc"'
+     prepare = "int fajita_touch_prepared = fajita_touch_prepare_before_handoff(pi.cmdline, this_mpidr, kernel_mpidr);"
+-    ack = 'const char *ack = fajita_touch_prepared ? " fajita_touch_prepared=1" : " fajita_touch_prepared=0";'
++    ack = 'const char *ack = " fajita_touch_prepared=0 fajita_touch_tlmm=0";'
+     if any(loader.count(marker) != 1 for marker in (include, prepare, ack)):
+         raise SystemExit("touch power integration must include exactly one preparation and acknowledgement")
+     if not loader.index(prepare) < loader.index('/* --- hand off'):
+@@ -73,9 +73,16 @@
+     cmdline_copy = '\tfor (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {'
+     if not loader.index(cmdline_copy) < loader.index(ack) < loader.index('ba->commandLine[n] = 0;', loader.index(ack)):
+         raise SystemExit("firmware acknowledgement must be appended after the payload command line")
+-    if 'n + sizeof(" fajita_touch_prepared=0") > BOOT_LINE_LENGTH' not in loader:
++    if 'n + str_len(ack) + 1 > BOOT_LINE_LENGTH' not in loader:
+         raise SystemExit("touch acknowledgement requires a command line bound check")
+     power = (args.loader.parent / "fajita_touch_rpmh.inc").read_text()
++    for layout in (1, 2):
++        if f'ack = " fajita_touch_prepared=1 fajita_touch_tlmm={layout}";' not in loader:
++            raise SystemExit("final acknowledgement must carry the selected TLMM layout")
++    if power.index('ctx.tlmm_layout = fp_chip_layout();') > power.index('fp_read(FAJITA_TOUCH_CMD_DB_DICT_PA)'):
++        raise SystemExit("chip layout must be validated before any touch MMIO")
++    if 'fajita_power_status = 0x80080000u;' not in power:
++        raise SystemExit("unknown silicon must skip touch before MMIO")
+     critical = power[power.index('tpl = raise(31);'):power.index('restore(tpl);')]
+     if 'fp_mask_interrupts();' not in critical or 'fp_hold(ctx->tcs);' not in critical or 'print(' in critical:
+         raise SystemExit("uncertain RPMh operations must hold without firmware console or cleanup")
+diff --git a/scripts/verify-fajita-touch.py b/scripts/verify-fajita-touch.py
+--- a/scripts/verify-fajita-touch.py
++++ b/scripts/verify-fajita-touch.py
+@@ -39,10 +39,14 @@
+     if re.search(r"!ft_f(?:01|12)\[", source):
+         raise SystemExit("PDT base zero is a legal register address")
+     board = (args.xnu / "bsd/dev/fajita_touch_board.h").read_text()
+-    for name, address in (("SDA", "0x03931000"), ("SCL", "0x03932000"), ("IRQ", "0x0397d000")):
+-        if f"FAJITA_TOUCH_{name}_PA" not in bus or not re.search(
+-                rf"^#define FAJITA_TOUCH_{name}_PA {address}u$", board, re.MULTILINE):
++    for name, address in (("SDA", "0x03931000"), ("SCL", "0x03932000"),
++                          ("IRQ_V1", "0x0397d000"), ("IRQ_V2", "0x0357d000")):
++        if not re.search(rf"^#define FAJITA_TOUCH_{name}_PA {address}u$", board, re.MULTILINE):
+             raise SystemExit(f"missing verified GPIO page: {name} {address}")
++    if ('static const uint64_t ft_pin_pa' in bus or
++            'fajita_touch_gpio_pa(layout, gpio[i])' not in bus or
++            'if (ft_pin_pa[i] == 0)' not in bus):
++        raise SystemExit("kernel GPIO pages must be selected by a supported firmware TLMM layout before mapping")
+     if 'ft_input(FT_IRQ, FAJITA_TOUCH_ACTIVE_IRQ_CTL)' not in bus:
+         raise SystemExit("IRQ must use the fajita DT active pull-up/16 mA config")
+     if 'PE_parse_boot_argn("fajita_touch_inherit"' not in source or 'inherited != 1' not in source:
+@@ -52,6 +56,10 @@
+     init = source[source.index("void fajita_touch_init(void)"):]
+     if init.index('inherited != 1') > init.index("thread_call_allocate"):
+         raise SystemExit("inherited-power guard must precede deferred startup allocation")
++    if ('PE_parse_boot_argn("fajita_touch_tlmm"' not in init or
++            'if (!fajita_bus_select_layout(layout))' not in init or
++            not init.index('inherited != 1') < init.index('fajita_bus_select_layout(layout)') < init.index('thread_call_allocate')):
++        raise SystemExit("firmware-ready guard must precede TLMM layout selection, which must precede deferred allocation")
+     if 'kernel_thread_start' in init or 'printf(' in init:
+         raise SystemExit("early touch initialization must only arm deferred startup without console formatting")
+     if not init.index('clock_interval_to_deadline') < init.index('thread_call_enter_delayed'):
+@@ -83,7 +91,7 @@
+         raise SystemExit("scan writes must follow product identification")
+     if "slot" not in source or "ft_release_all();" not in source or "errors >= 8" not in source:
+         raise SystemExit("missing report/error release handling")
+-    print("touch checks passed: staged source, hooks, opt-in Product ID, firmware-ready/inherit gate, three kernel GPIO pages, no kernel PMIC/reset, GPIO restore, report release")
++    print("touch checks passed: staged source, hooks, opt-in Product ID, firmware-ready/inherit/layout gates, three kernel GPIO pages, no kernel PMIC/reset, GPIO restore, report release")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/scripts/audit-fajita-touch-dt.py b/scripts/audit-fajita-touch-dt.py
+--- a/scripts/audit-fajita-touch-dt.py
++++ b/scripts/audit-fajita-touch-dt.py
+@@ -16,6 +16,18 @@
+ VENDOR_COMMIT = "222822c2d0042067b7964c6302ef4d756dc4bed9"
+ LIMITATION = ("Description audit only: this does not prove runtime power, "
+               "controller identity, I2C access, or working touch.")
++TLMM_LAYOUTS = {
++    "qcom,sdm845-pinctrl": {
++        "name": "v1", "layout": 1, "versions": (0x10000,),
++        "source": "drivers/pinctrl/qcom/pinctrl-sdm845.c",
++        "tiles": {49: "NORTH", 50: "NORTH", 88: "SOUTH", 99: "NORTH", 125: "NORTH"},
++    },
++    "qcom,sdm845-pinctrl-v2": {
++        "name": "v2", "layout": 2, "versions": (0x20000, 0x20001),
++        "source": "drivers/pinctrl/qcom/pinctrl-sdm845-v2.c",
++        "tiles": {49: "NORTH", 50: "NORTH", 88: "EAST", 99: "NORTH", 125: "EAST"},
++    },
++}
+ 
+ 
+ class Fdt:
+@@ -80,6 +92,13 @@
+     active = dt.symbol("qupv3_se12_i2c_active")
+     supply = dt.symbol("pm8998_l28")
+     tlmm = dt.symbol("tlmm")
++    model = dt.strings("/", "model")
++    require(len(model) == 1, "missing or ambiguous base model")
++    chip = {"model": model[0], "msm_id": dt.cells("/", "qcom,msm-id"),
++            "board_id": dt.cells("/", "qcom,board-id")}
++    tlmm_info = {"path": tlmm, "reg": dt.cells(tlmm, "reg"),
++                 "compatible": dt.strings(tlmm, "compatible")}
++    layout_for_base({**chip, "tlmm": tlmm_info})
+     reg = dt.cells(bus, "reg")
+     pins = pin_state(dt, active)
+     require(reg == [0xA90000, 0x4000], f"unexpected SE12 register range: {reg}")
+@@ -111,12 +130,12 @@
+     require(dt.strings(parent, "compatible") == ["qcom,rpmh-vrm-regulator"], "not a VRM rail")
+     require(dt.cells(parent, "mboxes")[0:1] == dt.cells(rsc, "phandle"),
+             "ldoa28 does not use the selected apps RSC")
+-    return {**dt.metadata(), "power": power, "bus": {"path": bus, "reg": reg,
++    return {**dt.metadata(), **chip, "power": power, "bus": {"path": bus, "reg": reg,
+             "base_status": dt.strings(bus, "status"), "active_path": active,
+             "active": pins}, "supply": {"path": supply, "name": "pm8998_l28",
+             "voltage_min_uv": dt.cells(supply, "regulator-min-microvolt"),
+             "voltage_max_uv": dt.cells(supply, "regulator-max-microvolt")},
+-            "tlmm": {"path": tlmm, "reg": dt.cells(tlmm, "reg")}}
++            "tlmm": tlmm_info}
+ 
+ 
+ def overlay_info(dt):
+@@ -185,32 +204,64 @@
+     return int(match[1], 16 if match[1].lower().startswith("0x") else 10)
+ 
+ 
++def layout_for_base(base):
++    compatible = base["tlmm"]["compatible"]
++    require(len(compatible) == 1 and compatible[0] in TLMM_LAYOUTS,
++            f"unsupported TLMM compatible: {compatible}")
++    description = TLMM_LAYOUTS[compatible[0]]
++    msm_id = base["msm_id"]
++    require(len(msm_id) == 2 and msm_id[0] == 321 and msm_id[1] in description["versions"],
++            f"TLMM compatible/SoC revision mismatch: {compatible}, msm-id {msm_id}")
++    return description
++
++
+ def vendor_mapping(bases):
+     repo = ROOT / "ref/oneplus-sdm845-q"
+-    relative = "drivers/pinctrl/qcom/pinctrl-sdm845.c"
+-    path = repo / relative
+-    source_bytes = path.read_bytes()
+-    original = subprocess.run(["git", "-C", str(repo), "show", VENDOR_COMMIT + ":" + relative],
+-                              capture_output=True)
+-    require(original.returncode == 0 and source_bytes == original.stdout,
+-            "local pinctrl source does not match the fixed vendor commit")
+-    source = source_bytes.decode()
+-    stride = literal_macro(source, "REG_SIZE")
+-    offsets = {tile: literal_macro(source, tile) for tile in ("NORTH", "SOUTH")}
+-    require(re.search(r"\.ctl_reg\s*=\s*base\s*\+\s*REG_SIZE\s*\*\s*id", source),
+-            "unrecognized vendor GPIO_CTL address formula")
+-    tlmm_base, tlmm_size = bases[0]["tlmm"]["reg"][:2]
+-    pins = {}
+-    for gpio, tile in ((49, "NORTH"), (50, "NORTH"), (88, "SOUTH"), (99, "NORTH"), (125, "NORTH")):
+-        groups = re.findall(r"\bPINGROUP\(\s*" + str(gpio) + r"\s*,\s*(NORTH|SOUTH)\s*,", source)
+-        require(groups == [tile], f"unexpected tile for GPIO{gpio}: {groups}")
+-        pa = tlmm_base + offsets[tile] + stride * gpio
+-        require(tlmm_base <= pa and pa + stride <= tlmm_base + tlmm_size,
+-                f"GPIO{gpio} is outside the DT TLMM resource")
+-        pins[str(gpio)] = {"tile": tile, "ctl_pa": pa}
+-    return {"path": str(path.relative_to(ROOT)), "commit": VENDOR_COMMIT,
+-            "sha256": hashlib.sha256(source_bytes).hexdigest(), "tile_offsets": offsets,
+-            "tlmm_resource_pa": tlmm_base, "gpio_stride": stride, "gpio": pins,
++    sources, layouts, selections = {}, {}, []
++    for base in bases:
++        description = layout_for_base(base)
++        name, relative = description["name"], description["source"]
++        if relative not in sources:
++            path = repo / relative
++            source_bytes = path.read_bytes()
++            original = subprocess.run(["git", "-C", str(repo), "show", VENDOR_COMMIT + ":" + relative],
++                                      capture_output=True)
++            require(original.returncode == 0 and source_bytes == original.stdout,
++                    f"local pinctrl source does not match the fixed vendor commit: {relative}")
++            source = source_bytes.decode()
++            require(re.search(r"\.ctl_reg\s*=\s*base\s*\+\s*REG_SIZE\s*\*\s*id", source),
++                    f"unrecognized vendor GPIO_CTL address formula: {relative}")
++            sources[relative] = (source, hashlib.sha256(source_bytes).hexdigest())
++        source, digest = sources[relative]
++        stride = literal_macro(source, "REG_SIZE")
++        offsets = {tile: literal_macro(source, tile) for tile in sorted(set(description["tiles"].values()))}
++        reg = base["tlmm"]["reg"]
++        require(len(reg) >= 2, "missing DT TLMM resource")
++        tlmm_base, tlmm_size = reg[:2]
++        pins = {}
++        for gpio, tile in description["tiles"].items():
++            groups = re.findall(r"\bPINGROUP\(\s*" + str(gpio) + r"\s*,\s*(NORTH|SOUTH|EAST)\s*,", source)
++            require(groups == [tile], f"unexpected {name} tile for GPIO{gpio}: {groups}")
++            pa = tlmm_base + offsets[tile] + stride * gpio
++            require(tlmm_base <= pa and pa + stride <= tlmm_base + tlmm_size,
++                    f"{name} GPIO{gpio} is outside the DT TLMM resource")
++            pins[str(gpio)] = {"tile": tile, "ctl_pa": pa}
++        mapping = {"path": str((repo / relative).relative_to(ROOT)), "commit": VENDOR_COMMIT,
++                   "sha256": digest, "compatible": base["tlmm"]["compatible"],
++                   "layout": description["layout"], "chip_versions": list(description["versions"]),
++                   "tile_offsets": offsets, "tlmm_resource_pa": tlmm_base,
++                   "gpio_stride": stride, "gpio": pins}
++        require(name not in layouts or layouts[name] == mapping,
++                f"TLMM mappings differ within {name} base DTBs")
++        layouts[name] = mapping
++        selections.append({"path": base["path"], "model": base["model"],
++                           "msm_id": base["msm_id"], "board_id": base["board_id"], "layout": name})
++    require(set(layouts) == {"v1", "v2"}, "both SDM845 v1 and v2 descriptions must be audited")
++    for gpio in ("49", "50", "99"):
++        require(layouts["v1"]["gpio"][gpio] == layouts["v2"]["gpio"][gpio],
++                f"shared GPIO{gpio} differs between SDM845 v1/v2")
++    return {"layouts": layouts, "base_selections": selections,
++            "revision_limitation": "These input variants do not identify this phone's silicon revision; runtime ChipInfo selects the layout.",
+             "i2c_role_provenance": "unknown: DT and pinctrl do not label SDA versus SCL"}
+ 
+ 
+@@ -275,14 +326,20 @@
+ 
+ def check_header(path, vendor, power, base):
+     source = path.read_text()
++    v1, v2 = vendor["layouts"]["v1"], vendor["layouts"]["v2"]
++    require(not re.search(r"^\s*#\s*define\s+FAJITA_TOUCH_(?:IRQ|VDDIO)_PA\b", source, re.M),
++            "unversioned IRQ/VDDIO addresses must not bypass runtime layout selection")
+     expected = {"I2C_ADDRESS": 32, "SDA_GPIO": 49, "SCL_GPIO": 50, "IRQ_GPIO": 125,
+                 "RESET_GPIO": 99, "VDDIO_GPIO": 88, "IRQ_DRIVE_MA": 16,
+                 "I2C_DRIVE_MA": 2, "AVDD_UV": 3008000, "AVDD_LOAD_UA": 20000,
+-                "SDA_PA": vendor["gpio"]["49"]["ctl_pa"],
+-                "SCL_PA": vendor["gpio"]["50"]["ctl_pa"],
+-                "IRQ_PA": vendor["gpio"]["125"]["ctl_pa"],
+-                "RESET_PA": vendor["gpio"]["99"]["ctl_pa"],
+-                "VDDIO_PA": vendor["gpio"]["88"]["ctl_pa"],
++                "CHIP_ID": 321, "TLMM_LAYOUT_V1": v1["layout"], "TLMM_LAYOUT_V2": v2["layout"],
++                "SDA_PA": v1["gpio"]["49"]["ctl_pa"],
++                "SCL_PA": v1["gpio"]["50"]["ctl_pa"],
++                "IRQ_V1_PA": v1["gpio"]["125"]["ctl_pa"],
++                "IRQ_V2_PA": v2["gpio"]["125"]["ctl_pa"],
++                "RESET_PA": v1["gpio"]["99"]["ctl_pa"],
++                "VDDIO_V1_PA": v1["gpio"]["88"]["ctl_pa"],
++                "VDDIO_V2_PA": v2["gpio"]["88"]["ctl_pa"],
+                 "CMD_DB_DICT_PA": base["dictionary_reg"][0],
+                 "CMD_DB_RESERVED_START": base["reserved_reg"][1],
+                 "CMD_DB_RESERVED_END": base["reserved_reg"][1] + base["reserved_reg"][3],
+@@ -297,7 +354,7 @@
+         checked[name] = actual
+     return {"path": str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path),
+             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "macros": checked,
+-            "pa_note": "PA checks use the DT TLMM base and the fixed vendor PINGROUP tile/stride formula.",
++            "pa_note": "PA checks select each fixed vendor PINGROUP source using that base's TLMM compatible and msm-id; GPIO88/125 differ between v1/v2.",
+             "coordinate_note": "1080x2340 comes from the vendor S3706 branch with the "
+                 "oem,support_1080x2340_tp flag, overriding DT panel-coords 1080x2160.",
+             "i2c_role_limitation": "DT identifies the gpio49/gpio50 QUP12 pair but does not label "
+@@ -317,7 +374,7 @@
+                     for i in range(6, 13)]
+         require(all(o["description"] == overlays[0]["description"] for o in overlays),
+                 "fajita touch descriptions differ across overlays 06..12")
+-        normalized = [{k: b[k] for k in ("bus", "supply", "tlmm", "power")} for b in bases]
++        normalized = [{k: b[k] for k in ("bus", "supply", "power")} for b in bases]
+         require(all(b == normalized[0] for b in normalized), "touch bus/power descriptions differ across base DTBs")
+         vendor = vendor_mapping(bases)
+         power = vendor_power(bases)
+@@ -335,7 +392,7 @@
+         except OSError:
+             pass
+         raise SystemExit(f"touch DT audit failed: {error}") from error
+-    print(f"PASS: 3 base DTBs, 7 consistent fajita overlays, board constants; {args.out}")
++    print(f"PASS: 3 revision-specific base DTBs, v1/v2 TLMM mappings, 7 consistent fajita overlays, board constants; {args.out}")
+     print(LIMITATION)
+ 
+ 
+diff --git a/scripts/test-fajita-touch-host.sh b/scripts/test-fajita-touch-host.sh
+--- a/scripts/test-fajita-touch-host.sh
++++ b/scripts/test-fajita-touch-host.sh
+@@ -10,7 +10,7 @@
+         -fno-omit-frame-pointer "$ROOT/tests/test-fajita-$name.c" -o "$OUT/$name"
+     "$OUT/$name"
+ done
+-for name in touch-startup touch-transport touch-runtime touch-rpmh touch-handoff live-reader touch-panel-reader touch-panel-staging touch-dt-audit; do
++for name in chipinfo touch-startup touch-transport touch-runtime touch-rpmh touch-handoff live-reader touch-panel-reader touch-panel-staging touch-dt-audit; do
+     python3 "$ROOT/tests/test-fajita-$name.py"
+ done
+ python3 "$ROOT/scripts/audit-fajita-touch-dt.py"
+diff --git a/tests/test-fajita-chipinfo.py b/tests/test-fajita-chipinfo.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test-fajita-chipinfo.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python3
++"""Run the real metadata query and compare its ABI to Qualcomm's header."""
++import os
++from pathlib import Path
++import subprocess
++
++ROOT = Path(__file__).resolve().parents[1]
++OUT = ROOT / ".work/tests/fajita-chipinfo"
++OUT.mkdir(parents=True, exist_ok=True)
++source = (ROOT / "devices/fajita/loader/fajita_touch_rpmh.inc").read_text()
++start = source.index("static uint32_t fp_chip_layout(void)")
++end = source.index("static bool fp_pin_output(", start)
++query = source[start:end]
++harness = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++#include "efi.h"
++typedef uint32_t UINT32;
++typedef uint64_t UINT64;
++typedef char CHAR8;
++typedef efi_status EFI_STATUS;
++typedef efi_guid EFI_GUID;
++#define IN
++#define OUT
++#include "EFIChipInfo.h"
++#include "fajita_touch_board.h"
++#include "fajita_chipinfo.h"
++_Static_assert(offsetof(struct fajita_chipinfo_protocol, revision) ==
++    offsetof(EFI_CHIPINFO_PROTOCOL, Revision), "real revision offset");
++_Static_assert(offsetof(struct fajita_chipinfo_protocol, get_chip_version) ==
++    offsetof(EFI_CHIPINFO_PROTOCOL, GetChipVersion), "real version offset");
++_Static_assert(offsetof(struct fajita_chipinfo_protocol, get_chip_id) ==
++    offsetof(EFI_CHIPINFO_PROTOCOL, GetChipId), "real ID offset");
++_Static_assert(sizeof(EFIChipInfoVersionType) == sizeof(uint32_t), "version width");
++_Static_assert(sizeof(EFIChipInfoIdType) == sizeof(uint32_t), "ID width");
++_Static_assert(EFICHIPINFO_ID_SDM845 == FAJITA_TOUCH_CHIP_ID, "real chip ID");
++static efi_boot_services services;
++static efi_boot_services *BS = &services;
++static struct fajita_chipinfo_protocol chip;
++static uint32_t id, version;
++static unsigned locates, ids, versions, prints;
++static bool locate_error, no_protocol, id_error, version_error;
++static void print(const char *fmt, ...) { assert(strstr(fmt,"TLMM layout")); prints++; }
++static efi_status get_id(struct fajita_chipinfo_protocol *self, uint32_t *out) {
++    assert(self == &chip); ids++;
++    if (id_error) return EFI_ERROR_BIT | 24;
++    *out = id; return 0;
++}
++static efi_status get_version(struct fajita_chipinfo_protocol *self, uint32_t *out) {
++    assert(self == &chip); versions++;
++    if (version_error) return EFI_ERROR_BIT | 24;
++    *out = version; return 0;
++}
++static efi_status locate(const efi_guid *guid, void *registration, void **out) {
++    const efi_guid expected = EFI_CHIPINFO_PROTOCOL_GUID;
++    assert(!memcmp(guid,&expected,sizeof(expected)) && registration == NULL);
++    locates++;
++    if (locate_error) return EFI_ERROR_BIT | 14;
++    *out = no_protocol ? NULL : &chip; return 0;
++}
++static void reset(void) {
++    memset(&services,0,sizeof(services)); memset(&chip,0,sizeof(chip));
++    services.locate_protocol=locate; chip.revision=EFI_CHIPINFO_PROTOCOL_REVISION;
++    chip.get_chip_id=get_id; chip.get_chip_version=get_version;
++    id=321; version=EFI_CHIPINFO_VERSION(2,1);
++    locates=ids=versions=prints=0;
++    locate_error=no_protocol=id_error=version_error=false;
++}
++'''
++tests = r'''
++int main(void) {
++    const uint32_t versions_to_test[]={0,0x10000,0x10001,0x20000,0x20001,0x20002,0x30000,UINT32_MAX};
++    const uint32_t ids_to_test[]={0,320,321,322,UINT32_MAX};
++    for(unsigned i=0;i<sizeof(ids_to_test)/sizeof(ids_to_test[0]);i++)
++    for(unsigned v=0;v<sizeof(versions_to_test)/sizeof(versions_to_test[0]);v++) {
++        reset();id=ids_to_test[i];version=versions_to_test[v];
++        unsigned expected=0;
++        if(id==321 && version==0x10000) expected=1;
++        if(id==321 && (version==0x20000 || version==0x20001)) expected=2;
++        assert(fp_chip_layout()==expected);
++        assert(locates==1 && ids==1 && versions==1 && prints==1);
++    }
++    reset(); services.locate_protocol=NULL;
++    assert(!fp_chip_layout() && !locates && !ids && !versions);
++    reset(); locate_error=true; assert(!fp_chip_layout() && locates==1 && !ids && !versions);
++    reset(); no_protocol=true; assert(!fp_chip_layout() && locates==1 && !ids && !versions);
++    const uint64_t invalid_revision[]={0,0xffff,0x20000,UINT64_MAX};
++    for(unsigned i=0;i<sizeof(invalid_revision)/sizeof(invalid_revision[0]);i++) {
++        reset();chip.revision=invalid_revision[i];
++        assert(!fp_chip_layout() && !ids && !versions);
++    }
++    reset();chip.get_chip_id=NULL; assert(!fp_chip_layout() && !ids && !versions);
++    reset();chip.get_chip_version=NULL; assert(!fp_chip_layout() && !ids && !versions);
++    reset();id_error=true; assert(!fp_chip_layout() && ids==1 && !versions && !prints);
++    reset();version_error=true; assert(!fp_chip_layout() && ids==1 && versions==1 && !prints);
++    assert(fajita_touch_gpio_pa(1,88)==0x03d58000 && fajita_touch_gpio_pa(2,88)==0x03558000);
++    assert(fajita_touch_gpio_pa(1,125)==0x0397d000 && fajita_touch_gpio_pa(2,125)==0x0357d000);
++    assert(!fajita_touch_gpio_pa(0,88) && !fajita_touch_gpio_pa(3,88));
++    assert(!fajita_touch_gpio_pa(1,0) && !fajita_touch_gpio_pa(2,150));
++    puts("ChipInfo: real Qualcomm ABI/GUID/ID, known revisions, query failures and no default tile passed");
++}
++'''
++path = OUT / "chipinfo.c"
++path.write_text(harness + "\n" + query + "\n" + tests)
++includes = [ROOT / "devices/fajita/kernel", ROOT / "devices/fajita/loader",
++            ROOT / "ref/dipper-xnu/work/hackios/xnuloader",
++            ROOT / "ref/edk2-sdm845/Silicon/Qualcomm/QcomPkg/Include/Protocol"]
++binary = OUT / "chipinfo"
++subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1",
++                "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
++                *("-I" + str(p) for p in includes), str(path), "-o", str(binary)], check=True)
++subprocess.run([str(binary)], check=True, env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
+diff --git a/tests/test-fajita-touch-rpmh.py b/tests/test-fajita-touch-rpmh.py
+--- a/tests/test-fajita-touch-rpmh.py
++++ b/tests/test-fajita-touch-rpmh.py
+@@ -29,6 +29,7 @@
+     "fp_mask_interrupts": "assert(tpl_state == 31); daif_state |= 0xc0;",
+     "fp_restore_interrupts": "assert(tpl_state == 4); daif_state = daif;",
+     "fp_database": "assert(pa == db_pa); maps++; return table;",
++    "fp_chip_layout": "chip_queries++; return mock_layout;",
+ }.items():
+     replace_body(name, body)
+ # Retain the real hold/report path, replacing only its architectural WFE.
+@@ -47,6 +48,7 @@
+ #include "fajita_touch_board.h"
+ #include "fajita_rpmh_transaction.h"
+ #define EFIAPI
++typedef uint64_t efi_status;
+ static struct { void *raise_tpl, *restore_tpl; } boot_services;
+ static typeof(boot_services) *BS = &boot_services;
+ static const int platform_fajita, other_platform;
+@@ -56,12 +58,17 @@
+ static size_t log_len;
+ static uint32_t framebuffer[64*32];
+ static struct { uint64_t base; uint32_t width,height,stride; } SCREEN;
+-static unsigned tpl_state, raises, restores, writes, gpio_writes, rsc_writes, maps;
++static unsigned tpl_state, raises, restores, reads, writes, gpio_writes, rsc_writes, maps;
+ static unsigned triggers, selected, clean_calls, held_panel_calls;
++static unsigned mock_layout, chip_queries;
+ static uint64_t frequency, ticks, daif_state;
+ static uint32_t table_size, db_pa, geometry;
+ static uint8_t table[512];
+ static uint32_t rsc[0x3000/4], pin[3][2];
++static uint32_t last_gpio_io_write[3];
++/* GPIO_IN is a physical sample, independent of the output latch. The mock
++ * must never manufacture input-loopback success from a write to GPIO_OUT. */
++static bool pin_input_high[3], pin_control_write_ignored[3], pin_output_write_ignored[3];
+ static bool stopped, suppress_completion_irq, no_command_completion, keep_engine_busy, bad_completion;
+ static bool deferred_completion, completion_pending;
+ static uint64_t completion_at;
+@@ -90,7 +97,10 @@
+     restores++; tpl_state=4; daif_state &= ~0x80u;
+ }
+ static uint32_t *gpio(uint64_t pa,unsigned *index,unsigned *offset) {
+-    const uint32_t bases[]={FAJITA_TOUCH_RESET_PA,FAJITA_TOUCH_VDDIO_PA,FAJITA_TOUCH_IRQ_PA};
++    const uint32_t bases[]={
++        fajita_touch_gpio_pa(mock_layout,FAJITA_TOUCH_RESET_GPIO),
++        fajita_touch_gpio_pa(mock_layout,FAJITA_TOUCH_VDDIO_GPIO),
++        fajita_touch_gpio_pa(mock_layout,FAJITA_TOUCH_IRQ_GPIO)};
+     for(unsigned i=0;i<3;i++) if(pa==bases[i] || pa==bases[i]+4u) {
+         *index=i; *offset=(unsigned)(pa-bases[i])/4; return pin[i];
+     }
+@@ -118,6 +128,7 @@
+     }
+ }
+ static uint32_t mock_read(uint64_t pa) {
++    reads++;
+     if(pa==FAJITA_TOUCH_CMD_DB_DICT_PA) return db_pa;
+     if(pa==FAJITA_TOUCH_CMD_DB_DICT_PA+4u) return table_size;
+     if(pa==FAJITA_TOUCH_RSC_CONFIG_PA+0xcu) return geometry;
+@@ -136,7 +147,7 @@
+         return value;
+     }
+     unsigned index,off; uint32_t *p=gpio(pa,&index,&off); assert(p);
+-    return off ? ((p[1]&2u)|((p[1]&2u)>>1)) : p[0];
++    return off ? ((p[1]&~1u)|(pin_input_high[index]?1u:0u)) : p[0];
+ }
+ static void mock_write(uint64_t pa,uint32_t v) {
+     writes++;
+@@ -172,20 +183,31 @@
+         return;
+     }
+     assert(tpl_state==4); unsigned index,off; uint32_t *p=gpio(pa,&index,&off); assert(p);
+-    gpio_writes++; p[off]=v;
+-    if(off) { assert(ngpio<32); gpio_events[ngpio++]=(typeof(gpio_events[0])){index,(v&2)!=0,ticks}; }
++    gpio_writes++;
++    if(off) {
++        /* Input bit 0 is read-only; bit 1 can independently fail to latch. */
++        last_gpio_io_write[index]=v;
++        uint32_t mask=1u|(pin_output_write_ignored[index]?2u:0u);
++        p[1]=(p[1]&mask)|(v&~mask);
++        assert(ngpio<32);gpio_events[ngpio++]=(typeof(gpio_events[0])){index,(p[1]&2)!=0,ticks};
++    } else if(!pin_control_write_ignored[index]) p[0]=v;
+ }
+ static void w16(unsigned o,unsigned v) { table[o]=(uint8_t)v;table[o+1]=(uint8_t)(v>>8); }
+ static void w32(unsigned o,unsigned v) { for(unsigned i=0;i<4;i++) table[o+i]=(uint8_t)(v>>(8*i)); }
+ static void init(void) {
+     memset(table,0,sizeof(table));memset(rsc,0,sizeof(rsc));memset(pin,0,sizeof(pin));
++    memset(last_gpio_io_write,0,sizeof(last_gpio_io_write));
++    memset(pin_input_high,0,sizeof(pin_input_high));
++    memset(pin_control_write_ignored,0,sizeof(pin_control_write_ignored));
++    memset(pin_output_write_ignored,0,sizeof(pin_output_write_ignored));
+     memset(framebuffer,0,sizeof(framebuffer));memset(log_buf,0,sizeof(log_buf));
+     w32(0,1);w32(4,0x0c0330db);w16(8,4);w16(12,64);w16(14,1);
+     memcpy(table+144,"ldoa28",6);w32(160,0x40020);
+     table_size=sizeof(table);db_pa=FAJITA_TOUCH_CMD_DB_RESERVED_START;
+     geometry=(8u<<(6*FAJITA_TOUCH_RSC_DRV_ID))|(3u<<27);
+     tpl_state=4; daif_state=0x100;frequency=19200000;ticks=0;
+-    raises=restores=writes=gpio_writes=rsc_writes=maps=triggers=ngpio=clean_calls=held_panel_calls=0;
++    raises=restores=reads=writes=gpio_writes=rsc_writes=maps=triggers=ngpio=clean_calls=held_panel_calls=0;
++    mock_layout=FAJITA_TOUCH_TLMM_LAYOUT_V2;chip_queries=0;
+     incomplete_reads=busy_reads=command_completions=0;completion_at=0;
+     deferred_completion=completion_pending=false;
+     log_len=0;screen_quiet=0;stopped=suppress_completion_irq=no_command_completion=keep_engine_busy=bad_completion=false;PLAT=&platform_fajita;
+@@ -199,6 +221,50 @@
+ tests = r'''
+ int main(void) {
+     const char *on="fajita_touch=1 fajita_touch_power=1";
++    const unsigned output_gpio[]={FAJITA_TOUCH_RESET_GPIO,FAJITA_TOUCH_VDDIO_GPIO};
++    const unsigned layouts[]={FAJITA_TOUCH_TLMM_LAYOUT_V1,FAJITA_TOUCH_TLMM_LAYOUT_V2};
++    const uint32_t output_controls[]={0,FAJITA_TOUCH_ACTIVE_IRQ_CTL};
++    for(unsigned layout=0;layout<2;layout++)
++    for(unsigned index=0;index<2;index++) for(unsigned input=0;input<2;input++)
++    for(unsigned high=0;high<2;high++) for(unsigned control=0;control<2;control++) {
++        init();mock_layout=layouts[layout];pin_input_high[index]=input!=0;
++        uint32_t output_pa=fajita_touch_gpio_pa(mock_layout,output_gpio[index]);
++        uint32_t old_control=0xa5a5fc00u|0x15u;
++        uint32_t old_io=0x6b6b5a5cu|(high?0u:2u);
++        pin[index][0]=old_control;pin[index][1]=old_io;
++        uint32_t requested=(output_controls[control]|(1u<<9))&0x3ffu;
++        assert(fp_pin_output(output_pa,high!=0,output_controls[control]));
++        assert(pin[index][0]==((old_control&~0x3ffu)|requested));
++        assert(pin[index][1]==((old_io&~2u)|(high?2u:0u)));
++        assert(last_gpio_io_write[index]==((old_io&~3u)|input|(high?2u:0u)));
++        assert((mock_read(output_pa+4u)&1u)==input);
++        assert(gpio_writes==2 && ngpio==1 && !rsc_writes);
++    }
++    for(unsigned layout=0;layout<2;layout++)
++    for(unsigned index=0;index<2;index++) for(unsigned input=0;input<2;input++)
++    for(unsigned high=0;high<2;high++) for(unsigned fault=0;fault<2;fault++) {
++        init();mock_layout=layouts[layout];pin_input_high[index]=input!=0;
++        uint32_t output_pa=fajita_touch_gpio_pa(mock_layout,output_gpio[index]);
++        pin[index][0]=0xa5a5fc00u|0x15u;
++        pin[index][1]=0x6b6b5a5cu|(high?0u:2u);
++        pin_control_write_ignored[index]=fault==0;
++        pin_output_write_ignored[index]=fault==1;
++        assert(!fp_pin_output(output_pa,high!=0,0));
++        if(fault==0) assert(pin[index][0]==(0xa5a5fc00u|0x15u));
++        else assert((pin[index][1]&2u)==(high?0u:2u));
++        assert(!rsc_writes);
++    }
++    const uint32_t rejected_pa[]={0,FAJITA_TOUCH_IRQ_V1_PA,FAJITA_TOUCH_IRQ_V2_PA,
++        FAJITA_TOUCH_RESET_PA+4u,FAJITA_TOUCH_RESET_PA+8u,
++        FAJITA_TOUCH_VDDIO_V1_PA+4u,FAJITA_TOUCH_VDDIO_V2_PA+4u,UINT32_MAX};
++    for(unsigned n=0;n<sizeof(rejected_pa)/sizeof(rejected_pa[0]);n++) {
++        init();assert(!fp_pin_output(rejected_pa[n],true,0));
++        assert(!reads && !writes && !gpio_writes && !rsc_writes && !ngpio);
++    }
++    init();mock_layout=0;
++    assert(!fajita_touch_prepare_before_handoff(on,0,0x700));
++    assert(chip_queries==1 && fajita_power_status==0x80080000u);
++    assert(!reads && !writes && !maps && !raises && !restores && !ngpio);
+     const char *off[]={"", "fajita_touch=0 fajita_touch_power=1", "fajita_touch=1",
+         "fajita_touch=11 fajita_touch_power=1", "xfajita_touch=1 fajita_touch_power=1",
+         "fajita_touch=1 fajita_touch_power=1 fajita_touch=0"};
+@@ -244,6 +310,32 @@
+     assert(gpio_events[2].high && !gpio_events[3].high && gpio_events[4].high);
+     assert(ticks-gpio_events[5].at>=1920000 && pin[2][0]==0x1c3);
+     assert(rsc[FAJITA_RPMH_IRQ_ENABLE/4]==0x103 && rsc[FAJITA_RPMH_CONTROL/4]==0);
++    /* Run the actual board sequence with every independent input-level
++     * combination. Neither reset nor supply writes require an input echo. */
++    for(unsigned layout=0;layout<2;layout++) for(unsigned inputs=0;inputs<8;inputs++) {
++        init();mock_layout=layouts[layout];
++        for(unsigned index=0;index<3;index++) pin_input_high[index]=(inputs&(1u<<index))!=0;
++        for(unsigned index=0;index<2;index++) {
++            pin[index][0]=0xa5a5fc00u;pin[index][1]=0x6b6b5a5cu;
++        }
++        assert(fajita_touch_prepare_before_handoff(on,0,0x700)==1);
++        assert(chip_queries==1 && fajita_power_status==1 && triggers==1 && ngpio==6);
++        assert(pin[0][0]==(0xa5a5fc00u|FAJITA_TOUCH_ACTIVE_IRQ_CTL|(1u<<9)));
++        assert(pin[1][0]==(0xa5a5fc00u|(1u<<9)));
++        assert(pin[0][1]==(0x6b6b5a5cu|2u) && pin[1][1]==(0x6b6b5a5cu|2u));
++        assert(!gpio_events[0].high && gpio_events[1].high && gpio_events[2].high);
++        assert(!gpio_events[3].high && gpio_events[4].high && gpio_events[5].high);
++        for(unsigned n=1;n<5;n++) assert(gpio_events[n].at-gpio_events[n-1].at>=192000);
++        assert(ticks-gpio_events[5].at>=1920000);
++    }
++    /* Both kinds of failed GPIO write still fail the real board sequence. */
++    for(unsigned layout=0;layout<2;layout++) for(unsigned fault=0;fault<2;fault++) {
++        init();mock_layout=layouts[layout];
++        pin_control_write_ignored[1]=fault==0;pin_output_write_ignored[1]=fault==1;
++        assert(!fajita_touch_prepare_before_handoff(on,0,0x700));
++        assert(triggers==1 && (fajita_power_status&0xffu)==FAJITA_TOUCH_POWER_VDDIO_ENABLE_FAILED);
++        assert(pin[0][1]==0 && pin[1][1]==(fault==0?2u:0u));
++    }
+     init();suppress_completion_irq=deferred_completion=true;
+     /* Seed stale success before the trigger. The timer-driven mock clears it
+      * on trigger, then completes three commands and the engine independently. */
+@@ -281,7 +373,7 @@
+         assert((fajita_power_rpmh_detail>>56)==FAJITA_RPMH_REASON_POSTTRIGGER_FATAL);
+         assert(framebuffer[64*16]==0x00ff0000 && framebuffer[64*16-1]==0);
+     }
+-    puts("loader power integration: gates, timer, DB, geometry, critical section, exact sequence, both slots and fatal hold passed");
++    puts("loader power integration: both TLMM layouts, unknown-chip no-MMIO gate, GPIO independent input/output, RMW preservation and faults; gates, timer, DB, geometry, critical section, exact sequence, both slots and fatal hold passed");
+ }
+ '''
+ path = OUT / "backend.c"
+diff --git a/tests/test-fajita-touch-startup.py b/tests/test-fajita-touch-startup.py
+--- a/tests/test-fajita-touch-startup.py
++++ b/tests/test-fajita-touch-startup.py
+@@ -27,13 +27,14 @@
+ static thread_call_t ft_start_call;
+ static uint32_t ft_diag_enabled, ft_start_delay_ms = 30000, ft_poll_us = 8000;
+ static int ft_error;
+-static unsigned allocations, arms, starts, releases, lines;
++static unsigned allocations, arms, starts, releases, lines, selections;
++static uint32_t selected_layout;
+ static bool fail_allocate, fail_start;
+ static const char *last_line;
+ static uint64_t last_state;
+ static void ft_phase(uint32_t phase,uint32_t detail) { last_state=((uint64_t)phase<<32)|detail; }
+ struct boot_arg { const char *name; uint32_t value; };
+-static struct boot_arg args[8];
++static struct boot_arg args[16];
+ static size_t arg_count;
+ static void ft_thread(void *arg, int result) { (void)arg; (void)result; assert(false); }
+ static bool PE_parse_boot_argn(const char *key, void *value, int size) {
+@@ -42,6 +43,9 @@
+         memcpy(value,&args[i].value,4); return true;
+     }
+     return false;
++}
++static bool fajita_bus_select_layout(uint32_t layout) {
++    selections++; selected_layout=layout; return layout==1 || layout==2;
+ }
+ static void loader_log_line(const char *line) { lines++; last_line=line; }
+ static thread_call_t thread_call_allocate(thread_call_func_t fn, void *arg) {
+@@ -62,19 +66,29 @@
+ static void reset(void) {
+     memset(&call,0,sizeof(call)); ft_start_call=NULL;
+     ft_diag_enabled=0; ft_start_delay_ms=30000; ft_poll_us=8000; ft_error=0;
+-    allocations=arms=starts=releases=lines=0; fail_allocate=fail_start=false;
++    allocations=arms=starts=releases=lines=selections=0; selected_layout=0; fail_allocate=fail_start=false;
+     last_line=NULL; arg_count=0; last_state=0;
+ }
+-static void arg(const char *name,uint32_t value) { assert(arg_count<8); args[arg_count++]=(struct boot_arg){name,value}; }
+-static void enable(void) { arg("fajita_touch",1); arg("fajita_touch_inherit",1); }
++static void arg(const char *name,uint32_t value) { assert(arg_count<16); args[arg_count++]=(struct boot_arg){name,value}; }
++static void enable(void) { arg("fajita_touch",1); arg("fajita_touch_inherit",1); arg("fajita_touch_tlmm",2); }
+ int main(void) {
+     reset(); fajita_touch_init(); assert(!allocations && !starts && !lines);
+     reset(); arg("fajita_touch",0); fajita_touch_init(); assert(!allocations && !starts);
+-    reset(); arg("fajita_touch",1); fajita_touch_init(); assert(ft_error==6 && !allocations && !starts);
+-    reset(); enable(); arg("fajita_touch_power",1); fajita_touch_init(); assert(ft_error==6 && !allocations && !starts);
+-    reset(); enable(); arg("fajita_touch_power",1); arg("fajita_touch_prepared",0); fajita_touch_init(); assert(ft_error==6 && !allocations && !starts);
++    reset(); arg("fajita_touch",1); fajita_touch_init(); assert(ft_error==6 && !allocations && !starts && !selections);
++    reset(); enable(); arg("fajita_touch_power",1); fajita_touch_init(); assert(ft_error==6 && !allocations && !starts && !selections);
++    reset(); enable(); arg("fajita_touch_power",1); arg("fajita_touch_prepared",0); fajita_touch_init(); assert(ft_error==6 && !allocations && !starts && !selections);
+     reset(); arg("fajita_touch",1); arg("fajita_touch_power",1); arg("fajita_touch_prepared",1); fajita_touch_init();
+-    assert(allocations==1 && arms==1 && !starts);
++    assert(ft_error==7 && selections==1 && selected_layout==0 && !allocations && !arms && !starts);
++    reset(); arg("fajita_touch",1); arg("fajita_touch_inherit",1); fajita_touch_init();
++    assert(ft_error==7 && selections==1 && !allocations && !starts);
++    for (uint32_t layout=1;layout<=2;layout++) {
++        reset(); arg("fajita_touch",1); arg("fajita_touch_power",1); arg("fajita_touch_prepared",1);
++        arg("fajita_touch_tlmm",layout); fajita_touch_init();
++        assert(allocations==1 && arms==1 && !starts && selections==1 && selected_layout==layout);
++    }
++    reset(); arg("fajita_touch",1); arg("fajita_touch_power",1); arg("fajita_touch_prepared",1);
++    arg("fajita_touch_tlmm",3); fajita_touch_init();
++    assert(ft_error==7 && selections==1 && !allocations && !arms && !starts);
+     reset(); enable(); fajita_touch_init();
+     assert(allocations==1 && arms==1 && starts==0 && releases==0);
+     assert((last_state>>32)==FT_PHASE_DEFERRED_ARMED && (uint32_t)last_state==30000);
+@@ -92,7 +106,7 @@
+     assert(ft_error==5 && allocations==1 && !arms && !starts && !ft_start_call);
+     reset(); enable(); fail_start=true; fajita_touch_init(); call.callback(call.arg,NULL);
+     assert(ft_error==5 && starts==1 && !releases && strstr(last_line,"creation failed"));
+-    puts("touch startup: disabled/inherit gates, deferred execution, once-only scheduling, bounds and failures passed");
++    puts("touch startup: disabled/inherit/layout gates, deferred execution, once-only scheduling, bounds and failures passed");
+ }
+ '''
+ source = OUT / "startup.c"
+diff --git a/tests/test-fajita-touch-transport.py b/tests/test-fajita-touch-transport.py
+--- a/tests/test-fajita-touch-transport.py
++++ b/tests/test-fajita-touch-transport.py
+@@ -29,6 +29,8 @@
+ #define NSEC_PER_MSEC 1000000u
+ #define NSEC_PER_USEC 1000u
+ static uint32_t regs[3][2];
++static uint64_t mapped_pa[3];
++static uint32_t expected_irq_pa;
+ static unsigned maps, writes, rises, starts, stops, bit_at, bit_count;
+ static uint8_t bits[256], edges[256];
+ static bool force_scl_low, trace;
+@@ -41,10 +43,10 @@
+ static uint64_t mach_absolute_time(void) { ticks++; return ticks; }
+ static void nanoseconds_to_absolutetime(uint64_t ns, uint64_t *out) { *out=ns; }
+ static vm_offset_t ml_io_map(uint64_t pa, size_t length) {
+-    assert(length==0x1000); maps++;
++    assert(length==0x1000 && maps<3); mapped_pa[maps++]=pa;
+     if (pa==FAJITA_TOUCH_SDA_PA) return (vm_offset_t)regs[0];
+     if (pa==FAJITA_TOUCH_SCL_PA) return (vm_offset_t)regs[1];
+-    assert(pa==FAJITA_TOUCH_IRQ_PA); return (vm_offset_t)regs[2];
++    assert(pa==expected_irq_pa); return (vm_offset_t)regs[2];
+ }
+ static unsigned pin_at(vm_offset_t p, unsigned *off) {
+     for (unsigned i=0;i<3;i++) {
+@@ -89,11 +91,20 @@
+     bit_at=bit_count=rises=starts=stops=0; trace=true;
+ }
+ static void end_trace(void) { assert(bit_at==bit_count); trace=false; }
+-int main(void) {
++static void exercise_bus(uint32_t layout) {
++    maps=writes=rises=starts=stops=bit_at=bit_count=0;
++    force_scl_low=trace=false; ticks=transport_note=0;
++    memset(mapped_pa,0,sizeof(mapped_pa));
++    expected_irq_pa=layout==1 ? 0x0397d000u : 0x0357d000u;
+     const uint32_t original[3][2]={{4,0},{4,0},{0x103,2}};
+     memcpy(regs,original,sizeof(regs));
+     assert(FAJITA_TOUCH_ACTIVE_IRQ_CTL==0x1c3u);
++    assert(fajita_bus_select_layout(layout));
+     assert(fajita_bus_init() && maps==3);
++    assert(mapped_pa[0]==0x03931000u && mapped_pa[1]==0x03932000u && mapped_pa[2]==expected_irq_pa);
++    /* A running transport may not change the silicon mapping underneath I/O. */
++    assert(!fajita_bus_select_layout(layout==1 ? 2 : 1));
++    assert(ft_pin_pa[FT_IRQ]==expected_irq_pa);
+     assert(regs[0][0]==0 && regs[1][0]==0 && regs[2][0]==0x1c3u);
+     assert(ft_gpio_pa((vm_offset_t)regs[0]+4)==FAJITA_TOUCH_SDA_PA+4);
+     assert(ft_gpio_pa(1)==0 && !fajita_irq_pending());
+@@ -148,7 +159,20 @@
+     assert(!fajita_i2c_read(0,bytes,0));
+     assert((transport_note&(1u<<10)) && (transport_note&(1u<<15)));
+     assert(((transport_note>>8)&3u)==0 && writes==before);
+-    puts("touch transport: DT pinmux, three-page scope, addresses, repeated START, ACK/NACK, recovery and restore passed");
++}
++int main(void) {
++    assert(!fajita_bus_init() && !maps && !writes);
++    for (uint32_t layout=0;layout<5;layout++) {
++        if(layout==1 || layout==2) continue;
++        assert(!fajita_bus_select_layout(layout));
++        assert(!fajita_bus_init() && !maps && !writes);
++        for(unsigned pin=0;pin<FT_PIN_COUNT;pin++) assert(ft_pin_pa[pin]==0 && ft_pin[pin]==0);
++    }
++    exercise_bus(1); exercise_bus(2);
++    assert(!fajita_bus_select_layout(0));
++    unsigned prior_maps=maps,prior_writes=writes;
++    assert(!fajita_bus_init() && maps==prior_maps && writes==prior_writes);
++    puts("touch transport: v1/v2 layout gates, DT pinmux, three-page scope, addresses, repeated START, ACK/NACK, recovery and restore passed");
+ }
+ '''
+ path = OUT / "transport.c"
+diff --git a/tests/test-fajita-touch-handoff.py b/tests/test-fajita-touch-handoff.py
+--- a/tests/test-fajita-touch-handoff.py
++++ b/tests/test-fajita-touch-handoff.py
+@@ -14,13 +14,39 @@
+ target.write_bytes(loader.read_bytes())
+ command = ["python3", str(ROOT / "scripts/ensure-fajita-touch-rpmh.py"), "--loader", str(target)]
+ subprocess.run(command, check=True, capture_output=True)
+-before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in OUT.glob("fajita_*")}
+-before["loader.c"] = hashlib.sha256(target.read_bytes()).hexdigest()
+-subprocess.run(command, check=True, capture_output=True)
+-after = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in OUT.glob("fajita_*")}
+-after["loader.c"] = hashlib.sha256(target.read_bytes()).hexdigest()
+-assert before == after
+ text = target.read_text()
++
++
++def staged_hashes():
++    result = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in OUT.glob("fajita_*")}
++    result["loader.c"] = hashlib.sha256(target.read_bytes()).hexdigest()
++    return result
++
++
++def stage_and_check(label, initial):
++    target.write_text(initial)
++    subprocess.run(command, check=True, capture_output=True)
++    assert target.read_text() == text, label
++    before = staged_hashes()
++    subprocess.run(command, check=True, capture_output=True)
++    assert staged_hashes() == before, label + " idempotence"
++
++
++ack_begin = text.index('const char *ack = " fajita_touch_prepared=0 fajita_touch_tlmm=0";')
++ack_end = text.index('if (n + str_len(ack) + 1 > BOOT_LINE_LENGTH) {', ack_begin)
++ack_end += len('if (n + str_len(ack) + 1 > BOOT_LINE_LENGTH) {')
++old_ack = ('const char *ack = fajita_touch_prepared ? " fajita_touch_prepared=1" : " fajita_touch_prepared=0";\n'
++           '\t\tif (n + sizeof(" fajita_touch_prepared=0") > BOOT_LINE_LENGTH) {')
++historical = text[:ack_begin] + old_ack + text[ack_end:]
++stage_and_check("historical ready-only upgrade", historical)
++include = '\n#include "fajita_touch_rpmh.inc"\n'
++prepare = '\tint fajita_touch_prepared = fajita_touch_prepare_before_handoff(pi.cmdline, this_mpidr, kernel_mpidr);\n'
++block_start = text.index('\t/* Only this final firmware-produced acknowledgement authorizes touch MMIO. */\n')
++block_end = text.index('\tba->commandLine[n] = 0;\n', block_start) + len('\tba->commandLine[n] = 0;\n')
++fresh = (text[:block_start] + text[block_end:]).replace(include, '', 1).replace(prepare, '', 1)
++assert include not in fresh and prepare not in fresh
++stage_and_check("fresh integration", fresh)
++stage_and_check("current integration", text)
+ anchor = '\tfor (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {'
+ start = text.index(anchor)
+ end = text.index('\tba->commandLine[n] = 0;', start) + len('\tba->commandLine[n] = 0;')
+@@ -39,10 +65,12 @@
+ #define BOOT_LINE_LENGTH 128
+ static const int platform_fajita, other;
+ static const int *PLAT=&platform_fajita;
+-static unsigned warnings;
++static unsigned warnings, fajita_power_tlmm_layout;
++static size_t str_len(const char *text) { return strlen(text); }
+ static void print(const char *text) { assert(strstr(text,"no room")); warnings++; }
+ struct boot_args { char commandLine[BOOT_LINE_LENGTH]; unsigned guard; };
+-static int assemble(struct boot_args *ba,const char *line,unsigned prefix,int fajita_touch_prepared) {
++static int assemble(struct boot_args *ba,const char *line,unsigned prefix,int fajita_touch_prepared,unsigned layout) {
++    fajita_power_tlmm_layout=layout;
+     struct { const char *cmdline; } pi={line};
+     unsigned n=prefix;
+     assert(prefix<BOOT_LINE_LENGTH);
+@@ -51,34 +79,72 @@
+ tests = r'''
+     return 1;
+ }
+-static int last_ready(const char *line) {
++static int last_value(const char *line,const char *name) {
+     int32_t value=-1;
+     parser_line=(char *)line;
+-    (void)PE_parse_boot_argn("fajita_touch_prepared",&value,sizeof(value));
++    (void)PE_parse_boot_argn(name,&value,sizeof(value));
+     return value;
++}
++static void check_ack(const struct boot_args *ba,unsigned ready,unsigned layout) {
++    assert(last_value(ba->commandLine,"fajita_touch_prepared")==((int)ready));
++    assert(last_value(ba->commandLine,"fajita_touch_tlmm")==((int)layout));
++    assert(ba->guard==0x73594a21);
+ }
+ int main(void) {
+     struct boot_args ba;
+     assert(israngesep('_')); /* Retained parser helper is otherwise unused. */
+-    assert(assemble(&ba,"fajita_touch_prepared=1",10,0) && last_ready(ba.commandLine)==0);
+-    assert(assemble(&ba,"fajita_touch_prepared=0",0,1) && last_ready(ba.commandLine)==1);
+-    unsigned ack=(unsigned)strlen(" fajita_touch_prepared=0");
++    const char *old[]={"", "fajita_touch_prepared=1 fajita_touch_tlmm=2",
++        "fajita_touch_prepared=0 fajita_touch_tlmm=1",
++        "fajita_touch_tlmm=7 fajita_touch_prepared=9"};
++    for(unsigned prepared=0;prepared<2;prepared++) {
++        for(unsigned layout=0;layout<4;layout++) {
++            unsigned ready=prepared && (layout==1 || layout==2);
++            unsigned chosen=ready ? layout : 0;
++            for(unsigned i=0;i<sizeof(old)/sizeof(old[0]);i++) {
++                assert(assemble(&ba,old[i],0,(int)prepared,layout));
++                check_ack(&ba,ready,chosen);
++            }
++            /* All 128 prefix positions, for each selector outcome. */
++            char expected[80];
++            int count=snprintf(expected,sizeof(expected),
++                " fajita_touch_prepared=%u fajita_touch_tlmm=%u",ready,chosen);
++            assert(count>0 && (unsigned)count<sizeof(expected));
++            unsigned ack=(unsigned)strlen(expected);
++            const unsigned lengths[]={0,1,22,41,127,128,255};
++            for(unsigned j=0;j<sizeof(lengths)/sizeof(lengths[0]);j++) {
++                char payload[256];memset(payload,'x',lengths[j]);payload[lengths[j]]=0;
++                for(unsigned n=0;n<BOOT_LINE_LENGTH;n++) {
++                    memset(&ba,0xa5,sizeof(ba));
++                    int ok=assemble(&ba,payload,n,(int)prepared,layout);
++                    unsigned copied=lengths[j];
++                    if(copied>BOOT_LINE_LENGTH-1-n) copied=BOOT_LINE_LENGTH-1-n;
++                    assert(ok==(n+copied+ack+1<=BOOT_LINE_LENGTH));
++                    if(ok) {
++                        assert(strlen(ba.commandLine)==n+copied+ack);
++                        assert(!strcmp(ba.commandLine+n+copied,expected));
++                        check_ack(&ba,ready,chosen);
++                    }
++                    assert(ba.guard==0x73594a21);
++                }
++            }
++        }
++    }
++    PLAT=&other;
+     for(unsigned n=0;n<BOOT_LINE_LENGTH;n++) {
+-        memset(&ba,0xa5,sizeof(ba));
+-        int ok=assemble(&ba,"",n,1);
+-        assert(ok==(n+ack<BOOT_LINE_LENGTH));
+-        if(ok) { assert(strlen(ba.commandLine)==n+ack && last_ready(ba.commandLine)==1); }
++        assert(assemble(&ba,"other=1",n,1,2));
++        assert(last_value(ba.commandLine,"fajita_touch_prepared")==-1);
++        assert(last_value(ba.commandLine,"fajita_touch_tlmm")==-1);
+         assert(ba.guard==0x73594a21);
+     }
+-    char huge[BOOT_LINE_LENGTH*2];memset(huge,'x',sizeof(huge));huge[sizeof(huge)-1]=0;
+-    assert(!assemble(&ba,huge,10,1) && ba.guard==0x73594a21);
+-    PLAT=&other;assert(assemble(&ba,"other=1",10,1) && last_ready(ba.commandLine)==-1);
++    /* Other platforms retain existing keys; this path appends neither key. */
++    assert(assemble(&ba,"fajita_touch_prepared=9 fajita_touch_tlmm=7",0,1,2));
++    check_ack(&ba,9,7);
+     assert(warnings>0);
+-    puts("handoff: idempotent staging, real XNU numeric parser, final ready overrides, all line bounds and non-fajita gate passed");
++    puts("handoff: fresh/historical/idempotent staging, real XNU numeric parser, final ready+layout overrides, all prefix/line bounds and non-fajita gate passed");
+ }
+ '''
+ source = OUT / "handoff.c"
+-tests = tests.replace('static int last_ready(', parser + '\nstatic int last_ready(', 1)
++tests = tests.replace('static int last_value(', parser + '\nstatic int last_value(', 1)
+ source.write_text(harness + code + tests)
+ binary = OUT / "handoff"
+ subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic",
+diff --git a/tests/test-fajita-touch-dt-audit.py b/tests/test-fajita-touch-dt-audit.py
+--- a/tests/test-fajita-touch-dt-audit.py
++++ b/tests/test-fajita-touch-dt-audit.py
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env python3
+-"""Reject altered power constants and replace stale successful audit reports."""
++"""Audit both silicon layouts; reject mixed mappings and stale PASS reports."""
++import copy
++import importlib.util
+ import json
+ from pathlib import Path
+ import subprocess
+@@ -8,6 +10,30 @@
+ OUT = ROOT / ".work/tests/fajita-touch-dt-audit"
+ OUT.mkdir(parents=True, exist_ok=True)
+ source = (ROOT / "devices/fajita/kernel/fajita_touch_board.h").read_text()
++script = ROOT / "scripts/audit-fajita-touch-dt.py"
++positive_report = OUT / "positive.json"
++positive = subprocess.run(["python3", str(script), "--out", str(positive_report)],
++                          capture_output=True, text=True)
++assert positive.returncode == 0, positive.stdout + positive.stderr
++report = json.loads(positive_report.read_text())
++assert report["status"] == "pass"
++assert [b["msm_id"] for b in report["bases"]] == [[321, 0x20001], [321, 0x10000], [321, 0x20000]]
++assert [b["tlmm"]["compatible"] for b in report["bases"]] == [
++    ["qcom,sdm845-pinctrl-v2"], ["qcom,sdm845-pinctrl"], ["qcom,sdm845-pinctrl-v2"]]
++assert [b["model"] for b in report["bases"]] == [
++    "Qualcomm Technologies, Inc. SDM845 v2.1 SoC",
++    "Qualcomm Technologies, Inc. SDM845 v1 SoC",
++    "Qualcomm Technologies, Inc. SDM845 v2 SoC"]
++assert [b["board_id"] for b in report["bases"]] == [[0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
++layouts = report["vendor_pinctrl"]["layouts"]
++assert {k: layouts["v1"]["gpio"][k]["ctl_pa"] for k in ("49", "50", "88", "99", "125")} == {
++    "49": 0x03931000, "50": 0x03932000, "88": 0x03D58000,
++    "99": 0x03963000, "125": 0x0397D000}
++assert {k: layouts["v2"]["gpio"][k]["ctl_pa"] for k in ("49", "50", "88", "99", "125")} == {
++    "49": 0x03931000, "50": 0x03932000, "88": 0x03558000,
++    "99": 0x03963000, "125": 0x0357D000}
++assert [b["layout"] for b in report["vendor_pinctrl"]["base_selections"]] == ["v2", "v1", "v2"]
++
+ cases = {
+     "voltage": source.replace("3008000u", "3000000u"),
+     "reset": source.replace("0x03963000u", "0x03563000u"),
+@@ -17,14 +43,59 @@
+     "reserved": source.replace("0x8ab00000u", "0xffffffffu"),
+     "duplicate": source + "\n#define FAJITA_TOUCH_AVDD_UV 3008000u\n",
+     "expression": source.replace("AVDD_UV 3008000u", "AVDD_UV (3008000u)"),
++    "vddio-v1-uses-v2": source.replace("0x03d58000u", "0x03558000u"),
++    "vddio-v2-uses-v1": source.replace("0x03558000u", "0x03d58000u"),
++    "irq-v1-uses-v2": source.replace("0x0397d000u", "0x0357d000u"),
++    "irq-v2-uses-v1": source.replace("0x0357d000u", "0x0397d000u"),
++    "layout-v2-uses-v1": source.replace("TLMM_LAYOUT_V2 2u", "TLMM_LAYOUT_V2 1u"),
++    "chip-id": source.replace("CHIP_ID 321u", "CHIP_ID 322u"),
++    "unversioned-vddio": source + "\n#define FAJITA_TOUCH_VDDIO_PA 0x03d58000u\n",
++    "unversioned-irq": source + "\n#define FAJITA_TOUCH_IRQ_PA 0x0397d000u\n",
+ }
+ for name, changed in cases.items():
+     assert changed != source
+     header, report = OUT / (name + ".h"), OUT / (name + ".json")
+     header.write_text(changed)
+     report.write_text('{"status":"pass"}')
+-    run = subprocess.run(["python3", str(ROOT / "scripts/audit-fajita-touch-dt.py"),
++    run = subprocess.run(["python3", str(script),
+                           "--board-header", str(header), "--out", str(report)], capture_output=True, text=True)
+     assert run.returncode != 0, name
+     assert json.loads(report.read_text())["status"] == "fail", name
+-print("DT audit: 8 altered/duplicate/nonliteral board definitions rejected; stale PASS cleared")
++
++# Exercise actual per-base selector/mapper with altered metadata, without
++# modifying any original EDL DTB or vendor source on disk.
++spec = importlib.util.spec_from_file_location("fajita_touch_dt_audit", script)
++audit = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(audit)
++base_cases = {}
++original_bases = json.loads(positive_report.read_text())["bases"]
++for index, label, compatible in ((0, "v21-uses-v1", "qcom,sdm845-pinctrl"),
++                                  (1, "v1-uses-v2", "qcom,sdm845-pinctrl-v2"),
++                                  (2, "v2-uses-v1", "qcom,sdm845-pinctrl")):
++    changed = copy.deepcopy(original_bases)
++    changed[index]["tlmm"]["compatible"] = [compatible]
++    base_cases[label] = changed
++for label, key, value in (("unknown-revision", "msm_id", [321, 0x20002]),
++                           ("wrong-chip", "msm_id", [322, 0x20001]),
++                           ("missing-revision", "msm_id", [321])):
++    changed = copy.deepcopy(original_bases)
++    changed[0][key] = value
++    base_cases[label] = changed
++for label, value in (("unknown-compatible", ["qcom,unknown-pinctrl"]),
++                      ("ambiguous-compatible", ["qcom,sdm845-pinctrl-v2", "qcom,sdm845-pinctrl"]),
++                      ("missing-compatible", [])):
++    changed = copy.deepcopy(original_bases)
++    changed[0]["tlmm"]["compatible"] = value
++    base_cases[label] = changed
++changed = copy.deepcopy(original_bases)
++changed[2]["tlmm"]["reg"][0] += 0x100000
++base_cases["same-layout-different-resource"] = changed
++for name, changed in base_cases.items():
++    try:
++        audit.vendor_mapping(changed)
++    except ValueError:
++        pass
++    else:
++        raise AssertionError(name)
++print(f"DT audit: both revision mappings retained; {len(cases)} invalid board headers rejected with stale PASS cleared; "
++      f"{len(base_cases)} incompatible/unknown SoC descriptions rejected")
