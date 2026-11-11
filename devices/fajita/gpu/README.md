@@ -83,7 +83,67 @@ adds `bsd/dev/fajita_adreno.c` to `bsd/conf/files`. It is idempotent.
 the order `a6xx_gpu.c`'s `hw_init` requires. It is data, not a driver: the
 caller owns GX power, clocks, the GMU OOB vote and security setup around it.
 
-## State: compiled, not yet run on the phone
+## Device results (2026-11-11)
+
+Run on the phone with `fastboot boot` only; no partition was written.
+
+| Steps | Result |
+| --- | --- |
+| 1..6 | **pass** — `fajitagpu: 6 steps: kkkkkk` |
+| 1..9 | **pass** — `fajitagpu: 9 steps: kkkkkkkkk` |
+| 1..10 | **failed twice, screen black, device left USB entirely** |
+
+Steps 1-9 passing is the substantive result: the GCC GPU branch bits, the RPMh
+supply names, the GPUCC power switches, the CX domain, the GMU clocks and the
+GMU's own always-on counter all behave as the SDM845 documents say. The counter
+being seen to count is what proves the GMU clock really runs. The SMMU and its
+context banks read back as the boot loader left them, and a two-word write to
+ITCM/DTCM is accepted and restorable.
+
+### Why step 10 fails, and what was wrong twice
+
+Writing the 32 KB `a630_gmu.bin` image kills the screen. Two corrections were
+attempted and neither fixed it; the third is built but **not yet run**.
+
+1. *Assumed the write ran past DTCM.* The register map puts
+   `GMU_CM3_ITCM_START` at word `0xc00` and `GMU_CM3_DTCM_START` at `0x1c00`,
+   only `0x4000` bytes apart, while the image is `0x8000` long. Checking Mesa's
+   `a6xx_gmu.xml` confirmed both offsets are exactly what the code uses, and
+   Linux's own legacy path (`a6xx_gmu.c:701-714`) writes the same `0x8000` from
+   the same base in one go. **That hypothesis was wrong**; the offsets and the
+   linear write are both correct.
+2. *Assumed the order was wrong.* Linux runs `gmu_write(GENERAL_7, 1)` and
+   `a6xx_rpmh_start()` before `a6xx_gmu_fw_load()`, and this driver had the
+   RSC/PDC step at 11, after the load. Reordering brought step 10 forward but
+   **called the wrong function**: `step_rsc_pdc()` only *reads* the PDC and
+   reports whether the reads match what was there, so it powers nothing on.
+   The machine still went black.
+3. *Fixed the function, not just the order.* `gmu_rpmh_start()` now does what
+   `a6xx_gmu.c:458-485` does and nothing else: write `RSCC_CONTROL_REQ = 1<<1`,
+   `dsb sy`, poll `RSCC_CONTROL_ACK` for bit 1, poll `RSCC_SEQ_BUSY_DRV0` for
+   idle, write `REQ = 0`. It returns before the load if any step fails. This is
+   deliberately **not** `gmu_rsc_sleep_wake()`, which sleeps the RSC first and
+   restores both halves -- a reversible probe for a later step, not the
+   pre-load power-on Linux performs.
+
+Step 9 passing while step 10 fails is consistent with this: reads and a
+two-word write work on an unpowered domain, a full image does not.
+
+**Next run should start at `fajitagpu=10` again.** If it goes black a third
+time, the remaining suspects are the write primitive (Linux uses one
+`memcpy_toio` plus `wmb()`; this driver issues 8192 separate `str` writes with
+no barrier) and whether `step_rsc_pdc`'s read-modify-restore of the PDC is
+itself unsafe before the GMU is up.
+
+## Build state
+
+- `fajita_adreno.o` builds clean, exports `_fajita_adreno_init`, and the kernel
+  links it alongside `_mi8_adreno_init` with no symbol conflict.
+- The only build failure is the tree's documented post-link `check_all_exports`
+  problem, which predates this work and is unrelated to it.
+- The bring-up is opt-in behind `fajitagpu=N`, which runs steps 1..N and stops.
+  With no such argument the driver touches nothing, so it is inert in every
+  image that does not pass it -- including the one touch was verified on.
 
 - `fajita_adreno.o` builds clean (509 KB), exports `_fajita_adreno_init`, and
   the kernel links it alongside `_mi8_adreno_init` with no symbol conflict.

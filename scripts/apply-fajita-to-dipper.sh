@@ -87,6 +87,7 @@ python3 "$ROOT/scripts/verify-fajita-gpu.py" --dtb "$ROOT/.work/edl-extract/boot
 python3 "$ROOT/scripts/ensure-fajita-live.py" --xnu "$XNU_SRC" --extra-files "$HACKIOS_ROOT/xnu/files" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
 python3 "$ROOT/scripts/ensure-fajita-touch-rpmh.py" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
 python3 "$ROOT/scripts/ensure-fajita-touch-panel.py" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
+python3 "$ROOT/scripts/ensure-fajita-gpu-diag.py" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
 python3 "$ROOT/scripts/verify-fajita-touch.py" --xnu "$XNU_SRC"
 
 mkdir -p "$EDK2_ROOT/Platform/Oneplus/sdm845"

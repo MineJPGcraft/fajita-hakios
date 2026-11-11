@@ -539,6 +539,12 @@ step_smmu_contexts(void)
 	return true;
 }
 
+/* Step 11, used by step 10: Linux loads the firmware only after the RSC/PDC
+ * sequence (a6xx_gmu.c:766-776), so step 10 calls it directly now. */
+static bool step_rsc_pdc(void);
+static bool gmu_rpmh_start(vm_offset_t rscc);
+static bool gmu_poll(vm_offset_t address, uint32_t mask, uint32_t want, uint32_t tries, uint32_t step_us);
+
 /* ---- steps 9 and 10: the GMU's memory ------------------------------------------------------------------ */
 
 extern const uint8_t *redwood_wifi_file(const char *name, uint64_t *size);  /* a file of fw/ in the small image, in place */
@@ -598,6 +604,41 @@ step_gmu_firmware(void)
 		printf("fajitagpu: the GMU's memory was not tried (step 9)\n");
 		return false;
 	}
+	/*
+	 * Linux loads this image only inside a6xx_gmu_fw_start(), and only after
+	 * two things that this driver used to do in the wrong order:
+	 *
+	 *   gmu_write(GENERAL_7, 1)    register retention, before anything is written
+	 *   a6xx_rpmh_start(gmu)       the RSC/PDC sequence, BEFORE fw_load
+	 *
+	 * a6xx_gmu.c:766-776 has that order. This driver used to load the firmware
+	 * at step 10 with the RPMh sequence still at step 11, i.e. after the write;
+	 * on the phone that wrote 32 KB into a GMU whose RPMh wake path was not set
+	 * up yet and the machine went black. Keep the order Linux keeps: make
+	 * retention, run the sequencer, then load, and load nothing if either of
+	 * the first two did not take.
+	 */
+	if (!gmu_clk_on) {
+		printf("fajitagpu: the GMU's clock is not running (step 5): no firmware is written\n");
+		return false;
+	}
+	{
+		uint32_t retention = 0;
+
+		wr(gmu_base + GMU_WORD(0x51cc), 1);
+		retention = rd(gmu_base + GMU_WORD(0x51cc));
+		printf("fajitagpu: register retention GENERAL_7 = %#x (Linux writes 1 before a6xx_rpmh_start)\n", retention);
+		if (retention != 1) {
+			printf("fajitagpu: register retention did not take: the firmware is not written\n");
+			return false;
+		}
+	}
+	if (gmu_base == 0 || !gmu_rpmh_start(gmu_base + 0x23000u)) {
+		printf("fajitagpu: the GPU's RSC was not powered (a6xx_rpmh_start): the firmware is not written\n");
+		return false;
+	}
+	printf("fajitagpu: RSC powered the GPU: RSCC_CONTROL_ACK %#010x, SEQ_BUSY_DRV0 %#010x\n",
+	    rd(gmu_base + GMU_WORD(0x9308)), rd(gmu_base + 0x23000u + 4 * 0x101));
 	fw = redwood_wifi_file("a630_gmu.bin", &size);
 	if (fw == NULL) {
 		printf("fajitagpu: the small image has no fw/a630_gmu.bin: stopping\n");
@@ -609,6 +650,17 @@ step_gmu_firmware(void)
 		printf("fajitagpu: that is not a size the GMU's memory takes (up to %#x, whole words): stopping\n", GMU_TCM_SIZE);
 		return false;
 	}
+	/*
+	 * Linux's legacy path is a4xx/a5xx GMUs that take one raw image from
+	 * GMU_CM3_ITCM_START for its whole length (a6xx_gmu.c:701-714), and it
+	 * sanity-checks exactly the 0x8000 this image is. The register map shows
+	 * DTCM only 0x4000 bytes above ITCM, which is why writing 0x8000 from one
+	 * base looks like it runs past DTCM: on these parts the TCM window the
+	 * GMU decodes behind GMU_CM3_ITCM_START is the full 32 KB and the DTCM
+	 * offsets address the same memory from another side, so both Linux and
+	 * this driver write it linearly. What was wrong was never the write, it
+	 * was doing it before the RPMh sequence.
+	 */
 	for (uint32_t i = 0; i < size / 4; i++) {
 		wr(gmu_base + GMU_ITCM + 4 * i, ((const uint32_t *)fw)[i]);
 		sum += ((const uint32_t *)fw)[i];
@@ -728,6 +780,39 @@ rs_mask(const struct rs_write *w)
 		return ~0x8u;
 	}
 	return ~0u;
+}
+
+/*
+ * a6xx_rpmh_start, and nothing else (a6xx_gmu.c:458-485). Linux runs this
+ * immediately before a6xx_gmu_fw_load: the RSC is asked to power the GPU's CX
+ * half, the request is acknowledged, and the sequence is waited out. Without it
+ * the GMU's TCM answers reads (which is what step 9 showed) but writing a full
+ * 32 KB image to it leaves the machine black -- the image goes into a domain
+ * that was never powered for it.
+ *
+ * This is deliberately NOT gmu_rsc_sleep_wake(), which puts the RSC to sleep
+ * first and restores both halves afterwards; that is a reversible probe for a
+ * later step. This one leaves the power on, as Linux does before loading.
+ */
+static bool
+gmu_rpmh_start(vm_offset_t rscc)
+{
+	if (gmu_base == 0) {
+		return false;
+	}
+	wr(gmu_base + GMU_WORD(0x9307), 1u << 1);
+	/* The vendor driver writes a barrier here (a6xx_gmu.c:465). */
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!gmu_poll(gmu_base + GMU_WORD(0x9308), 1u << 1, 1u << 1, 100, 100)) {
+		printf("fajitagpu: RSCC_CONTROL_ACK never showed bit 1: the RSC did not power the GPU\n");
+		return false;
+	}
+	if (!gmu_poll(rscc + 4 * 0x101, ~0u, 0, 100, 100)) {
+		printf("fajitagpu: RSCC_SEQ_BUSY_DRV0 stayed busy: the RSC wake sequence did not finish\n");
+		return false;
+	}
+	wr(gmu_base + GMU_WORD(0x9307), 0);
+	return true;
 }
 
 static bool
@@ -4425,16 +4510,40 @@ fajita_adreno_thread(void *parameter, __unused wait_result_t result)
 			(void)zap_load(false);
 		}
 	}
+	/*
+	 * The loader shows only the last 240 bytes of this log, every two seconds.
+	 * The steps print ~1500 bytes between them, so the per-step lines scroll
+	 * out of that window before they can be read. Keep one compact verdict per
+	 * step and print the whole run once at the end, so a single screen sample
+	 * carries every step's result: "G1k" means step 1 done, "G2S" step 2
+	 * stopped, 'k' done and 'S' stopped.
+	 */
+	char verdict[STEPS + 1] = { 0 };
+
 	for (uint32_t step = 1; step <= last && step <= STEPS; step++) {
 		printf("fajitagpu: step %u\n", step);
 		if (!steps[step - 1]()) {
+			verdict[step - 1] = 'S';
 			printf("fajitagpu: step %u: stopped; the steps after it are not attempted\n", step);
 			break;
 		}
+		verdict[step - 1] = 'k';
 		printf("fajitagpu: step %u: done\n", step);
 	}
 	teardown();
 	zap_release();
+	/* One line, at most 24 bytes: "fajitagpu: steps 6: kkkkkk" */
+	{
+		uint32_t ran = last <= STEPS ? last : STEPS;
+		char line[48];
+
+		for (uint32_t i = 0; i < ran; i++) {
+			if (verdict[i] != 'k' && verdict[i] != 'S') { verdict[i] = '.'; }
+		}
+		verdict[ran] = 0;
+		snprintf(line, sizeof(line), "fajitagpu: %u steps: %s\n", ran, verdict);
+		printf("%s", line);
+	}
 	printf("fajitagpu: over (fajitagpu=%u)\n", last);
 	thread_terminate(current_thread());
 }

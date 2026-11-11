@@ -50,6 +50,14 @@ def main() -> None:
     ensure_after(args.xnu / "bsd/conf/files", "bsd/dev/mi8_adreno.c",
                  "bsd/dev/fajita_adreno.c\tstandard")
 
+    # Without this call the driver is linked but never reached. It goes beside
+    # the other bring-up initialisers, and returns at once unless fajitagpu=N.
+    ensure_after(args.xnu / "bsd/dev/redwood_input.c", "\tmi8_adreno_init();",
+                 "\tfajita_adreno_init();")
+    ensure_after(args.xnu / "bsd/sys/redwood_input.h", "void mi8_adreno_init(void);",
+                 "void fajita_adreno_init(void);          /* boot-arg fajitagpu=N: "
+                 "the first N steps of waking the 6T's GPU (Adreno 630) */")
+
     print("fajita Adreno 630 driver staged; build list present")
 
 

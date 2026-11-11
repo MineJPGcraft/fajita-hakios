@@ -42,6 +42,18 @@ edk2-sdm845       e1952621f419f8db60ed28271264e1b5184c571d
 
 ## 当前适配进度
 
+**2026-11-11 GPU 进展：前 9 步实机通过，第 10 步仍失败。** Adreno 630 的 bring-up 从 dipper（小米 8，同 SDM845 同 GPU）移植而来，寄存器基址逐项比对本机 EDL 设备树（3D 核 `0x05000000`、GMU `0x0506a000`、SMMU `0x05040000`、GPUCC/GFXCC `0x05090000`），固件从本机官方 vendor 镜像提取（`a630_gmu.bin` 32768 字节、`a630_sqe.fw`、`a630_zap.*`，带 SHA256）。
+
+实机 `fastboot boot`（未写分区）结果：步骤 1–6 与 1–9 均全绿（`fajitagpu: 9 steps: kkkkkkkkk`）。这证明 GCC 的 GPU 时钟分支、RPMh 供电名、GPUCC 电源开关、CX 域、GMU 时钟，以及 **GMU 常开计数器确实在跳动**——即 GMU 时钟真实运行；SMMU 与上下文银行读回与 bootloader 留下的一致，ITCM/DTCM 的两字写入可接受且可恢复。
+
+步骤 10（写 32 KB `a630_gmu.bin`）**两次实机均黑屏**，设备随后从 USB 完全消失（连 9008 都不进），需长按电源恢复。两次修正都没有解决问题，第三次的修正已构建但**尚未实机验证**：
+
+1. 曾假设写入越过 DTCM 边界。查 Mesa 官方 `a6xx_gmu.xml` 确认 `ITCM_START=0xc00`、`DTCM_START=0x1c00` 与代码完全一致，Linux legacy 路径（`a6xx_gmu.c:701-714`）同样从同一基址连续写 `0x8000`——**该假设错误**，偏移与线性写入都是对的。
+2. 曾假设顺序错误。Linux 确实在 `a6xx_gmu_fw_load()` 前先 `GENERAL_7=1` 再 `a6xx_rpmh_start()`，而本驱动把 RSC/PDC 放到第 11 步。调整顺序后仍黑屏，因为**调错了函数**：`step_rsc_pdc()` 只读 PDC 并报告读回值是否与原来相同，它不给 GPU 上电。
+3. 现在新增 `gmu_rpmh_start()`，严格对应 `a6xx_gmu.c:458-485`：写 `RSCC_CONTROL_REQ = 1<<1`、`dsb sy`、轮询 `RSCC_CONTROL_ACK` bit1、轮询 `RSCC_SEQ_BUSY_DRV0` 空闲、写 `REQ=0`；任一步失败即在写固件前返回。这刻意**不是** `gmu_rsc_sleep_wake()`——后者先让 RSC 休眠再恢复两半，是可逆探针而非加载前的上电。
+
+步骤 9 通过而步骤 10 失败与上述解释自洽：未上电的域能接受读和两字写，但写整幅镜像不行。**下次实机仍从 `fajitagpu=10` 开始**；若仍黑屏，剩余疑点是写原语（Linux 用一次 `memcpy_toio` + `wmb()`，本驱动是 8192 次独立 `str` 且无屏障）以及 `step_rsc_pdc` 的读-改-恢复在 GMU 未启动前是否本身不安全。详见 [GPU 状态](devices/fajita/gpu/README.md)。
+
 **2026-11-10 触摸已实机工作。** 候选 `.work/candidates/fajita-touch-working-device-tested/boot-fajita-touch-panel.img`，12,840,960 字节，SHA-256 `e66921026ee908608c0df436949233ff0660938586303055bc59660e8ec065c0`，用户确认手机**首次响应触摸**。仅以 `fastboot boot` 临时启动，未写入任何分区；主机套件通过，压缩 FV loader 与 XNUP 一致。
 
 **决定性修复是删掉一个检查，而不是增加检查。** `ft_interrupt_mask()` 曾把 F01 `control1` 的读回值与刚写入的值做相等比较，不相等即失败。而固定提交的厂商驱动读了同一寄存器后**直接丢弃返回值**（`synaptics_driver_s3320.c:984-986`），只以总线结果判定成功。这块屏接受写入但读回不等于写入值（实测地址 `0x0e`），于是该比较以 `D=0x10D` 中止了整个识别流程。现在读回只作为 `ft_mask_readback` 遥测发布，不再裁决成败。
