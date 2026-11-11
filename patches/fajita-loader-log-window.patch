@@ -1,0 +1,62 @@
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -174,6 +174,7 @@
+ static int fajita_touch_panel_requested;
+ /* fajita_gpu_diag=1 keeps the log tail visible but drops touch's own FT= lines. */
+ static int fajita_gpu_diag_requested;
++static uint32_t fajita_log_window;      /* fajita_log_window=N: bytes of kernel log shown per sample */
+ static uint64_t live_kernel_lo, live_kernel_hi;
+ 
+ static void
+@@ -2332,7 +2333,11 @@
+ 		flush_dcache(live->log_ring_at + slide, live->log_ring_at + slide + 4);
+ 		after = *(volatile uint32_t *)(live->log_ring_at + slide);
+ 		if (after != ring_at) { continue; }
+-		count = fajita_log_tail_spans(live->log_head, live->log_ring, len, ring_at, wrapped, 240, spans);
++		/* 240 bytes was one screenful of a quiet boot; a GPU bring-up prints
++		 * far more per step, so show the tail of what was asked for. The
++		 * ring is 1 MB and the helper caps at ring, so any sane ask is safe. */
++		count = fajita_log_tail_spans(live->log_head, live->log_ring, len, ring_at, wrapped,
++		    fajita_log_window ? (uint64_t)fajita_log_window : 240, spans);
+ 		if (count >= 0) { break; }
+ 	}
+ 	print("%d s: the kernel has logged %d bytes, heartbeat %d; the last of it:\n", seconds, (uint64_t)len, live->heartbeat);
+@@ -3101,6 +3106,7 @@
+ 	fajita_touch_diag_requested = 0;
+ 	fajita_touch_panel_requested = 0;
+ 	fajita_gpu_diag_requested = 0;
++	fajita_log_window = 0;
+ 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
+ 	 * loader asked for (the loader stays resident across runs) */
+ 	block_write_requested = 0;
+@@ -3141,6 +3147,30 @@
+ 	int fajita_touch_prepared = fajita_touch_prepare_before_handoff(pi.cmdline, this_mpidr, kernel_mpidr);
+ 	fajita_touch_panel_requested = PLAT == &platform_fajita && fp_arg(pi.cmdline, "fajita_touch_panel=");
+ 	fajita_gpu_diag_requested = PLAT == &platform_fajita && fp_arg(pi.cmdline, "fajita_gpu_diag=");
++	{
++		/* strstr is not available here; scan for the key the way the rest of
++		 * this file reads its arguments, then take the digits after it. */
++		static const char key[] = "fajita_log_window=";
++		const char *p = pi.cmdline;
++		uint32_t value = 0;
++
++		while (*p != 0) {
++			unsigned k = 0;
++
++			while (key[k] != 0 && p[k] == key[k]) { k++; }
++			if (key[k] == 0) {
++				p += k;
++				while (*p >= '0' && *p <= '9') {
++					value = value > 100000u ? value : value * 10u + (uint32_t)(*p - '0');
++					p++;
++				}
++				/* The helper caps at the ring; clamp so one print stays bounded. */
++				fajita_log_window = value > 8192u ? 8192u : value;
++				break;
++			}
++			p++;
++		}
++	}
+ 	if (ufs_requested >= 2) {
+ 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
+ 	}

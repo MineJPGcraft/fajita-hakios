@@ -51,6 +51,37 @@ extern void loader_log_putc(char c);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
+/*
+ * Quiet by default. The loader shows only the last 240 bytes of the kernel log,
+ * sampled every two seconds; this driver's steps print about 25 KB between them,
+ * so in the default mode nothing of the GPU's own progress survives -- which is
+ * exactly what was observed: six and nine steps reported their result line
+ * because those runs ended normally, while the run that black-screened showed no
+ * GPU line at all.
+ *
+ * With fajitagpu_quiet=1 (on by default when fajitagpu= is given) only the
+ * lines marked `keep` are written: the step verdicts, and the individual
+ * decisions inside a step that can hang the machine. fajitagpu_verbose=1 turns
+ * the full log back on for a host-side read.
+ */
+static int fajita_gpu_quiet = -1;
+
+/* A line the quiet mode keeps: step verdicts and the points a hang could follow. */
+static int
+keep(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	return 0;
+}
+
 /* to the loader's log at once as well: a step that hangs the machine leaves no other trace */
 static int
 say(const char *format, ...)
@@ -64,7 +95,7 @@ say(const char *format, ...)
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
 	}
-	return printf("%s", line);
+	return keep("%s", line);
 }
 #define printf say
 
@@ -543,6 +574,8 @@ step_smmu_contexts(void)
  * sequence (a6xx_gmu.c:766-776), so step 10 calls it directly now. */
 static bool step_rsc_pdc(void);
 static bool gmu_rpmh_start(vm_offset_t rscc);
+static bool gmu_rpmh_init(vm_offset_t rscc);
+static bool gmu_rpmh_stop(vm_offset_t rscc);
 static bool gmu_poll(vm_offset_t address, uint32_t mask, uint32_t want, uint32_t tries, uint32_t step_us);
 
 /* ---- steps 9 and 10: the GMU's memory ------------------------------------------------------------------ */
@@ -627,17 +660,23 @@ step_gmu_firmware(void)
 
 		wr(gmu_base + GMU_WORD(0x51cc), 1);
 		retention = rd(gmu_base + GMU_WORD(0x51cc));
-		printf("fajitagpu: register retention GENERAL_7 = %#x (Linux writes 1 before a6xx_rpmh_start)\n", retention);
+		keep("fajitagpu: register retention GENERAL_7 = %#x (Linux writes 1 before a6xx_rpmh_start)\n", retention);
 		if (retention != 1) {
-			printf("fajitagpu: register retention did not take: the firmware is not written\n");
+			keep("fajitagpu: register retention did not take: the firmware is not written\n");
 			return false;
 		}
 	}
-	if (gmu_base == 0 || !gmu_rpmh_start(gmu_base + 0x23000u)) {
+	/* a6xx_rpmh_init before a6xx_rpmh_start: the RSC needs a PDC sequence
+	 * to answer the power request on, and that table lives here. */
+	if (gmu_base == 0 || !gmu_rpmh_init(gmu_base + 0x23000u)) {
+		printf("fajitagpu: the RSC/PDC handshake was not programmed: the firmware is not written\n");
+		return false;
+	}
+	if (!gmu_rpmh_start(gmu_base + 0x23000u)) {
 		printf("fajitagpu: the GPU's RSC was not powered (a6xx_rpmh_start): the firmware is not written\n");
 		return false;
 	}
-	printf("fajitagpu: RSC powered the GPU: RSCC_CONTROL_ACK %#010x, SEQ_BUSY_DRV0 %#010x\n",
+	keep("fajitagpu: RSC powered the GPU: RSCC_CONTROL_ACK %#010x, SEQ_BUSY_DRV0 %#010x\n",
 	    rd(gmu_base + GMU_WORD(0x9308)), rd(gmu_base + 0x23000u + 4 * 0x101));
 	fw = redwood_wifi_file("a630_gmu.bin", &size);
 	if (fw == NULL) {
@@ -661,10 +700,26 @@ step_gmu_firmware(void)
 	 * this driver write it linearly. What was wrong was never the write, it
 	 * was doing it before the RPMh sequence.
 	 */
+	/*
+	 * Write in 4 KB blocks with a visible marker between them. A phone that
+	 * resets takes this log with it, so the last marker printed is the only
+	 * record of how far the write got: the loader samples the tail every two
+	 * seconds, and a block boundary is where a bad offset would show first.
+	 * 4 KB is the distance between the ITCM and DTCM register offsets, so the
+	 * boundaries land exactly on the suspect region.
+	 */
+	const uint32_t block_words = 0x1000 / 4;
+
 	for (uint32_t i = 0; i < size / 4; i++) {
+		if ((i % block_words) == 0) {
+			/* Kept even in quiet mode: the last one printed is the only
+			 * record of how far a write got before a reset. */
+			keep("fajitagpu: fw block +%#x / %#x\n", (uint32_t)(4 * i), (uint32_t)size);
+		}
 		wr(gmu_base + GMU_ITCM + 4 * i, ((const uint32_t *)fw)[i]);
 		sum += ((const uint32_t *)fw)[i];
 	}
+	keep("fajitagpu: all %llu firmware words written\n", size / 4);
 	for (uint32_t i = 0; i < size / 4; i++) {
 		if (rd(gmu_base + GMU_ITCM + 4 * i) != ((const uint32_t *)fw)[i]) {
 			if (wrong++ == 0) {
@@ -783,6 +838,64 @@ rs_mask(const struct rs_write *w)
 }
 
 /*
+ * a6xx_rpmh_init (a6xx_gmu.c:517-580), kept: program the RSC's PDC handshake
+ * and sequencer, and leave it in place.
+ *
+ * a6xx_rpmh_start cannot succeed without this. The RSC is told to power the
+ * GPU and answers on RSCC_CONTROL_ACK only when a PDC sequence exists to carry
+ * the request; without the table below the request is simply never
+ * acknowledged. On the phone that showed as "the GPU's RSC was not powered",
+ * with GX correctly still SW_COLLAPSE -- the domain was never told to come up.
+ *
+ * This differs from step_rsc_pdc() on purpose: that one saves every value,
+ * programs the same table and restores it, which is a rehearsal. Loading the
+ * firmware needs the handshake to stay.
+ */
+static bool
+gmu_rpmh_init(vm_offset_t rscc)
+{
+	if (gmu_base == 0 || rscc == 0) {
+		return false;
+	}
+	rs_region[RS_RSCC] = rscc;
+	rs_region[RS_PDC] = ml_io_map(PDC_PHYS, PDC_SIZE);
+	rs_region[RS_SEQ] = ml_io_map(PDC_SEQ_PHYS, PDC_SIZE);
+	if (rs_region[RS_PDC] == 0 || rs_region[RS_SEQ] == 0) {
+		printf("fajitagpu: the PDC did not map: no RSC handshake\n");
+		return false;
+	}
+	/* Disable PDC while its tables are edited (a6xx_rpmh_init does the same). */
+	wr(rs_region[RS_PDC] + 4 * 0x1140, rd(rs_region[RS_PDC] + 4 * 0x1140) & ~1u);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t i = 0; i < RS_COUNT; i++) {
+		/*
+		 * ENABLE_PDC is written last and with its whole value: Linux ends
+		 * a6xx_rpmh_init with pdc_write(ENABLE_PDC, 0x80000001), and the
+		 * high bit is part of it. A read-modify-write of bit 0 here would
+		 * drop that bit and leave the PDC unable to answer the RSC.
+		 */
+		if ((rs_writes[i].region == RS_PDC) && (rs_writes[i].word == 0x1140)) {
+			continue;
+		}
+		wr(rs_address(&rs_writes[i]), rs_writes[i].value);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	/* "ensure no writes happen before the uCode is fully written" (a6xx_gmu.c) */
+	wr(rs_region[RS_PDC] + 4 * 0x1140, 0x80000001u);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	keep("fajitagpu: RSC handshake programmed: PDC_ENABLE %#010x, SEQ_START %#010x, BUSY_DRV0 %#010x\n",
+	    rd(rs_region[RS_PDC] + 4 * 0x1140), rd(rs_region[RS_RSCC] + 4 * 0x8),
+	    rd(rs_region[RS_RSCC] + 4 * 0x101));
+	/* a6xx_rpmh_init ends with a6xx_rpmh_stop(), which leaves the RSC in a
+	 * known off state for the start that follows. */
+	if (!gmu_rpmh_stop(rscc)) {
+		printf("fajitagpu: the RSC did not go to its off state after programming\n");
+		return false;
+	}
+	return true;
+}
+
+/*
  * a6xx_rpmh_start, and nothing else (a6xx_gmu.c:458-485). Linux runs this
  * immediately before a6xx_gmu_fw_load: the RSC is asked to power the GPU's CX
  * half, the request is acknowledged, and the sequence is waited out. Without it
@@ -794,6 +907,23 @@ rs_mask(const struct rs_write *w)
  * first and restores both halves afterwards; that is a reversible probe for a
  * later step. This one leaves the power on, as Linux does before loading.
  */
+/* a6xx_rpmh_stop (a6xx_gmu.c:487-502): ask the RSC off and wait for it. */
+static bool
+gmu_rpmh_stop(vm_offset_t rscc)
+{
+	if (gmu_base == 0) {
+		return false;
+	}
+	wr(gmu_base + GMU_WORD(0x9307), 1);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!gmu_poll(rscc + 4 * 0x4, 1u << 16, 1u << 16, 100, 100)) {
+		return false;
+	}
+	wr(gmu_base + GMU_WORD(0x9307), 0);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	return true;
+}
+
 static bool
 gmu_rpmh_start(vm_offset_t rscc)
 {
@@ -804,11 +934,11 @@ gmu_rpmh_start(vm_offset_t rscc)
 	/* The vendor driver writes a barrier here (a6xx_gmu.c:465). */
 	__asm__ volatile ("dsb sy" ::: "memory");
 	if (!gmu_poll(gmu_base + GMU_WORD(0x9308), 1u << 1, 1u << 1, 100, 100)) {
-		printf("fajitagpu: RSCC_CONTROL_ACK never showed bit 1: the RSC did not power the GPU\n");
+		keep("fajitagpu: RSCC_CONTROL_ACK never showed bit 1: the RSC did not power the GPU\n");
 		return false;
 	}
 	if (!gmu_poll(rscc + 4 * 0x101, ~0u, 0, 100, 100)) {
-		printf("fajitagpu: RSCC_SEQ_BUSY_DRV0 stayed busy: the RSC wake sequence did not finish\n");
+		keep("fajitagpu: RSCC_SEQ_BUSY_DRV0 stayed busy: the RSC wake sequence did not finish\n");
 		return false;
 	}
 	wr(gmu_base + GMU_WORD(0x9307), 0);
@@ -4521,14 +4651,14 @@ fajita_adreno_thread(void *parameter, __unused wait_result_t result)
 	char verdict[STEPS + 1] = { 0 };
 
 	for (uint32_t step = 1; step <= last && step <= STEPS; step++) {
-		printf("fajitagpu: step %u\n", step);
+		keep("fajitagpu: step %u\n", step);
 		if (!steps[step - 1]()) {
 			verdict[step - 1] = 'S';
-			printf("fajitagpu: step %u: stopped; the steps after it are not attempted\n", step);
+			keep("fajitagpu: step %u: stopped; the steps after it are not attempted\n", step);
 			break;
 		}
 		verdict[step - 1] = 'k';
-		printf("fajitagpu: step %u: done\n", step);
+		keep("fajitagpu: step %u: done\n", step);
 	}
 	teardown();
 	zap_release();
@@ -4698,6 +4828,17 @@ fajita_adreno_init(void)
 	uint32_t last = 0, only = 0;
 	thread_t thread;
 
+	{
+		uint32_t verbose = 0, quiet = 0;
+		/* Quiet unless verbose was asked for: the log window is 240 bytes. */
+		if (PE_parse_boot_argn("fajitagpu_verbose", &verbose, sizeof(verbose)) && verbose) {
+			fajita_gpu_quiet = 0;
+		} else if (PE_parse_boot_argn("fajitagpu_quiet", &quiet, sizeof(quiet))) {
+			fajita_gpu_quiet = quiet ? 1 : 0;
+		} else {
+			fajita_gpu_quiet = 1;
+		}
+	}
 	if (!PE_parse_boot_argn("fajitagpu", &last, sizeof(last)) || last == 0) {
 		if (PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) {
 			fajita_gpu_start_by_itself();

@@ -91,7 +91,40 @@ Run on the phone with `fastboot boot` only; no partition was written.
 | --- | --- |
 | 1..6 | **pass** — `fajitagpu: 6 steps: kkkkkk` |
 | 1..9 | **pass** — `fajitagpu: 9 steps: kkkkkkkkk` |
-| 1..10 | **failed twice, screen black, device left USB entirely** |
+| 1..10 | **pass** — `fajitagpu: 10 steps: kkkkkkkkkk` |
+
+Image `3d737c508e631571b6f3325c3579782031a076e1bb9857b9aae39b68d6f86c77`
+(12,880,384 bytes), archived with its boot args under
+`.work/candidates/fajita-gpu-step10-device-tested/`. The 32 KB `a630_gmu.bin`
+is in the GMU's memory with no word read back wrong.
+
+### What it took to load the firmware
+
+Step 10 failed four times before it passed. Each failure was a different real
+defect, and only the last three are worth remembering:
+
+| Attempt | Assumption | What was actually wrong |
+| --- | --- | --- |
+| 1 | write runs past DTCM | nothing — offsets match Mesa's XML, Linux writes the same linear 32 KB |
+| 2 | wrong order (RSC after the load) | called `step_rsc_pdc()`, which only reads the PDC |
+| 3 | needs a real RSC power-on | added `gmu_rpmh_start()`, but the RSC had no PDC sequence to answer on |
+| 4 | needs the handshake programmed | `PDC_GPU_ENABLE_PDC` was read-modify-written with `\| 1`, dropping bit 31 |
+| 5 | **passes** | after writing `ENABLE_PDC = 0x80000001` whole and running `a6xx_rpmh_stop()` |
+
+The load sequence that works, in order:
+
+```
+gmu_rpmh_init   disable PDC, write the 47-entry handshake table,
+                then write ENABLE_PDC = 0x80000001 (bit 31 included)
+gmu_rpmh_stop   REQ = 1, wait for RSC_STATUS0_DRV0 bit 16, REQ = 0
+gmu_rpmh_start  REQ = 1<<1, wait for ACK bit 1, wait BUSY_DRV0 idle, REQ = 0
+                then the 32 KB image, in 4 KB blocks with a marker each
+```
+
+Two of those five were caught only because the log became readable: the loader
+showed the last 240 bytes per two-second sample, and the GPU's steps print tens
+of kilobytes, so `fajita_log_window=4096` is what turned "no GPU logging at
+all" into "the GPU's RSC was not powered". Without it the fourth ran blind.
 
 Steps 1-9 passing is the substantive result: the GCC GPU branch bits, the RPMh
 supply names, the GPUCC power switches, the CX domain, the GMU clocks and the
