@@ -1,0 +1,147 @@
+--- a/iokit/Kernel/RedwoodGPU.cpp
++++ b/iokit/Kernel/RedwoodGPU.cpp
+@@ -70,6 +70,9 @@
+ void redwood_gpu_stop(void);
+ 
+ void RedwoodGPUStart(void);
++extern void loader_log_line(const char *line);
++static uint32_t gGPURequests;
++static bool gpuRegistered;
+ void RedwoodGPUStop(void);
+ void MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
+ }
+@@ -434,18 +437,112 @@
+ 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
+ 	gGPULock = IOLockAlloc();
+ 	gpu = OSTypeAlloc(RedwoodGPU);
+-	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++	{
++		char line[160];
++
++		snprintf(line, sizeof(line), "fajitagpu: start: platform %#llx, gpu %#llx, lock %#llx\n",
++		    (uint64_t)(uintptr_t)provider, (uint64_t)(uintptr_t)gpu, (uint64_t)(uintptr_t)gGPULock);
++		loader_log_line(line);
++	}
++	/* Every branch says so: a service that never registered looks exactly like a
++	 * window server that chose not to draw, and that is a whole round of
++	 * bring-up spent on the wrong layer. */
++	if (gpu == NULL || provider == NULL || !gpu->init()) {
+ 		OSSafeReleaseNULL(gpu);
+ 		IOLog("RedwoodGPU: cannot create the service\n");
++		loader_log_line("fajitagpu: RedwoodGPUStart: cannot create the service\n");
++		return;
++	}
++	if (!gpu->attach(provider)) {
++		/* The step registerService() refuses on: a node that cannot reach the
++		 * registry root through its provider. Said here so the two are not
++		 * confused. */
++		loader_log_line("fajitagpu: RedwoodGPUStart: attach() FAILED\n");
++		OSSafeReleaseNULL(gpu);
+ 		return;
+ 	}
++	loader_log_line("fajitagpu: RedwoodGPUStart: attach() ok\n");
+ 	if (!gpu->start(provider)) {
+ 		gpu->detach(provider);
+ 		IOLog("RedwoodGPU: the service did not start\n");
++		loader_log_line("fajitagpu: RedwoodGPUStart: the service did not start\n");
++	} else {
++		/* start() returned true, but registerService() can still have refused
++		 * silently: it walks the provider chain to the registry root and
++		 * returns without publishing when the walk does not arrive. Ask the
++		 * object itself where it ended up. */
++		char line[192];
++		IORegistryEntry * walk = gpu;
++		IORegistryEntry * root = IORegistryEntry::getRegistryRoot();
++		unsigned hops = 0;
++
++		while (walk != NULL && walk != root && hops < 64) {
++			IORegistryEntry * up = walk->getParentEntry(gIOServicePlane);
++
++			if (up == walk) {
++				break;
++			}
++			walk = up;
++			hops++;
++		}
++		snprintf(line, sizeof(line),
++		    "fajitagpu: start: service %s; walked %u parents, %s the root; name %s\n",
++		    gpu->inPlane(gIOServicePlane) ? "in the service plane" : "NOT in the service plane",
++		    hops, walk == root ? "reached" : "did NOT reach",
++		    gpu->getName() != NULL ? gpu->getName() : "(none)");
++		loader_log_line(line);
++		gpuRegistered = true;
+ 	}
+ 	gpu->release();
+ }
+ 
++/*
++ * Say whether the service this file started is actually published, and whether
++ * it can be opened. Called once, after RedwoodGPUStart(), by the phone's GPU
++ * driver: a service that failed to register and a window server that chose not
++ * to draw both look like a black screen, and telling them apart from the kernel
++ * side is the difference between looking at IOKit and looking at userland.
++ */
++extern "C" void
++RedwoodGPURegistryReport(void)
++{
++	char line[160];
++	unsigned n = 0;
++
++	if (!gpuRegistered) {
++		loader_log_line("fajitagpu: service: NOT registered (RedwoodGPUStart did not get that far)\n");
++		return;
++	}
++	{
++		/*
++		 * By NAME, not by class. serviceMatching() keys on IOProviderClass --
++		 * "the services whose provider is of this class" -- so asking it for
++		 * "RedwoodGPU" looks for children of a RedwoodGPU and can never find
++		 * RedwoodGPU itself. That is why this reported 0 while the service was
++		 * published all along: userland asks with IOServiceMatching(name),
++		 * which is nameMatching() here.
++		 */
++		OSDictionary * matching = IOService::nameMatching("RedwoodGPU");
++
++		if (matching != NULL) {
++			OSIterator * matched = IOService::getMatchingServices(matching);
++
++			if (matched != NULL) {
++				OSObject * o;
++
++				while ((o = matched->getNextObject()) != NULL) {
++					n++;
++				}
++				matched->release();
++			}
++			matching->release();
++		}
++	}
++	snprintf(line, sizeof(line), "fajitagpu: service: registered, %u in the registry, lock %s\n",
++	    n, gGPULock != NULL ? "allocated" : "MISSING");
++	loader_log_line(line);
++}
++
+ /* The run is ending (redwood_adreno.c): nobody is in the middle of anything when the GPU goes. */
+ void
+ RedwoodGPUStop(void)
+@@ -1314,6 +1411,20 @@
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t zero = 0, patience, waitBegan;
+ 
++	/* Every request that reaches the client is counted, with its selector and
++	 * the first few's outcome. A window server that never draws shows up here
++	 * as either no requests at all (it never opened the service) or requests
++	 * that stop early (something in the protocol is refused). */
++	if (gGPURequests < 0xffffffffu) {
++		gGPURequests++;
++	}
++	if (gGPURequests <= 12 || (gGPURequests & 255) == 0) {
++		char line[128];
++
++		snprintf(line, sizeof(line), "fajitagpu: XM %u: sel %#x, %llu bytes, bufs %#llx\n", gGPURequests, selector,
++		    (uint64_t)size, (uint64_t)(uintptr_t)fBuffers);
++		loader_log_line(line);
++	}
+ 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}

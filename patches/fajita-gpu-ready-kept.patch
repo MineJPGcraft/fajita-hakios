@@ -1,0 +1,211 @@
+--- a/bsd/dev/redwood_adreno.c
++++ b/bsd/dev/redwood_adreno.c
+@@ -3330,12 +3330,40 @@
+ 	}
+ }
+ 
++bool fajita_gpu_kept(void);
++uint64_t fajita_gpu_address(uint64_t size);
++void fajita_gpu_address_free(uint64_t address, uint64_t size);
++bool fajita_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void fajita_gpu_mapped(void);
++void fajita_gpu_unmap(uint64_t address, uint64_t size);
++bool fajita_gpu_done(uint32_t fence);
++uint32_t fajita_gpu_last(void);
++void fajita_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most, uint64_t *lost,
++    uint32_t *refused);
++bool fajita_gpu_parameter(uint32_t which, uint64_t *value);
++uint32_t fajita_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++void fajita_gpu_to_memory(void *start, uint64_t size);
++void fajita_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++bool fajita_gpu_recover(void);
++void fajita_gpu_report(const char *why);
++
+ bool
+ redwood_gpu_ready(void)
+ {
+ 	if (mi8_gpu_kept()) {
+ 		return true;
+ 	}
++	/*
++	 * The 6T's Adreno 630 runs from bsd/dev/fajita_adreno.c, whose keep flag is
++	 * its own static. Without this line a kept a630 is invisible here, the user
++	 * client refuses to start, and the window server falls back to software --
++	 * which is a black screen once the logo is gone, not a GPU crash. The
++	 * selftest that runs before the handover reports 200 of 200 right, so the
++	 * core itself is fine at this point.
++	 */
++	if (fajita_gpu_kept()) {
++		return true;
++	}
+ 	return gpu_kept;
+ }
+ 
+@@ -3346,6 +3374,16 @@
+ 	if (mi8_gpu_kept()) {
+ 		return mi8_gpu_parameter(which, value);
+ 	}
++	/*
++	 * Same gap as redwood_gpu_ready(): a kept a630 answers GET_PARAM from
++	 * its own file. Without this the user client is told 0x06030500, 512 KiB
++	 * of GMEM and redwood's frequencies -- an Adreno 642L's numbers given to
++	 * an Adreno 630. A window server that picks its shader variants and tile
++	 * sizes from those cannot draw, which reads as a black screen.
++	 */
++	if (fajita_gpu_kept()) {
++		return fajita_gpu_parameter(which, value);
++	}
+ 	switch (which) {
+ 	case 0x01:                              /* GPU_ID: none, the chip ID says it */
+ 	case 0x06:                              /* GMEM_BASE */
+@@ -3407,6 +3445,9 @@
+ 	if (mi8_gpu_kept()) {
+ 		return mi8_gpu_address(size);
+ 	}
++	if (fajita_gpu_kept()) {
++		return fajita_gpu_address(size);
++	}
+ 	size = gpu_address_span(size);
+ 	for (unsigned i = 0; i < gpu_free_count; i++) {
+ 		if (gpu_free[i].size >= size) {
+@@ -3433,6 +3474,10 @@
+ 		mi8_gpu_address_free(address, size);
+ 		return;
+ 	}
++	if (fajita_gpu_kept()) {
++		fajita_gpu_address_free(address, size);
++		return;
++	}
+ 	unsigned at;
+ 
+ 	size = gpu_address_span(size);
+@@ -3482,6 +3527,10 @@
+ 		mi8_gpu_space(used, live, largest, holes, most, lost, refused);
+ 		return;
+ 	}
++	if (fajita_gpu_kept()) {
++		fajita_gpu_space(used, live, largest, holes, most, lost, refused);
++		return;
++	}
+ 	*largest = 0;
+ 	for (unsigned i = 0; i < gpu_free_count; i++) {
+ 		if (gpu_free[i].size > *largest) {
+@@ -3503,6 +3552,9 @@
+ 	if (mi8_gpu_kept()) {
+ 		return mi8_gpu_map(address, phys, read_only);
+ 	}
++	if (fajita_gpu_kept()) {
++		return fajita_gpu_map(address, phys, read_only);
++	}
+ 	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
+ }
+ 
+@@ -3513,6 +3565,10 @@
+ 		mi8_gpu_mapped();
+ 		return;
+ 	}
++	if (fajita_gpu_kept()) {
++		fajita_gpu_mapped();
++		return;
++	}
+ 	space_commit(&core_space);
+ }
+ 
+@@ -3523,6 +3579,10 @@
+ 		mi8_gpu_unmap(address, size);
+ 		return;
+ 	}
++	if (fajita_gpu_kept()) {
++		fajita_gpu_unmap(address, size);
++		return;
++	}
+ 	uint32_t context = smmu_context(&core_space);
+ 
+ 	for (uint64_t offset = 0; offset < size; offset += 4096) {
+@@ -3543,6 +3603,13 @@
+ 		mi8_gpu_to_memory(start, size);
+ 		return;
+ 	}
++	/* Clean-and-invalidate the range for the kept a630 too: the window server
++	 * calls this around every submission, and redwood's own cache maintenance
++	 * does not know the a630's mapped pages. */
++	if (fajita_gpu_kept()) {
++		fajita_gpu_to_memory(start, size);
++		return;
++	}
+ 	to_memory((vm_offset_t)start, size);
+ }
+ 
+@@ -3553,6 +3620,9 @@
+ 	if (mi8_gpu_kept()) {
+ 		return mi8_gpu_done(fence);
+ 	}
++	if (fajita_gpu_kept()) {
++		return fajita_gpu_done(fence);
++	}
+ 	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+ 
+ 	to_memory((vm_offset_t)word, 4);
+@@ -3565,6 +3635,9 @@
+ 	if (mi8_gpu_kept()) {
+ 		return mi8_gpu_last();
+ 	}
++	if (fajita_gpu_kept()) {
++		return fajita_gpu_last();
++	}
+ 	return gpu_fence;
+ }
+ 
+@@ -3624,6 +3697,10 @@
+ 		mi8_gpu_worked(microseconds, submissions, by);
+ 		return;
+ 	}
++	if (fajita_gpu_kept()) {
++		fajita_gpu_worked(microseconds, submissions, by);
++		return;
++	}
+ 	gpu_times();
+ 	*microseconds = gpu_ticks * 10 / 192;
+ 	*submissions = gpu_timed_count;
+@@ -3644,6 +3721,17 @@
+ 	if (mi8_gpu_kept()) {
+ 		return mi8_gpu_submit(addresses, words, count);
+ 	}
++	/*
++	 * The one that matters for a picture: every draw the window server makes
++	 * arrives here. Without this branch the commands went into redwood's ring,
++	 * which an Adreno 630 does not read -- the core stayed idle, nothing was
++	 * drawn, and the screen went black once the boot logos were over. That is
++	 * why the step-22 test picture appeared (it is drawn by fajita_adreno.c
++	 * itself, before any handover) while the system's own rendering did not.
++	 */
++	if (fajita_gpu_kept()) {
++		return fajita_gpu_submit(addresses, words, count);
++	}
+ 	uint32_t wanted = 26 + 4 * count, room = 0;
+ 
+ 	for (int i = 0; i < 20000; i++) {
+@@ -3693,6 +3781,10 @@
+ 		mi8_gpu_report(why);
+ 		return;
+ 	}
++	if (fajita_gpu_kept()) {
++		fajita_gpu_report(why);
++		return;
++	}
+ 	uint32_t context = smmu_context(&core_space);
+ 
+ 	printf("adreno: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; status "
+@@ -3768,6 +3860,12 @@
+ 	if (mi8_gpu_kept()) {
+ 		return mi8_gpu_recover();
+ 	}
++	/* A stopped a630 is recovered by its own file, which knows the ring the
++	 * core actually reads. Without this the recovery path answers "no" and
++	 * every submission after the core stops is dropped for good. */
++	if (fajita_gpu_kept()) {
++		return fajita_gpu_recover();
++	}
+ 	uint32_t fence_status;
+ 
+ 	if (!gpu_kept || !gpu_recover) {

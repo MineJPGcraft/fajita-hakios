@@ -1,0 +1,183 @@
+diff --git a/hakios-metal/Makefile b/hakios-metal/Makefile
+index f8a1f35..1bb4bf8 100644
+--- a/hakios-metal/Makefile
++++ b/hakios-metal/Makefile
+@@ -34,7 +34,7 @@ HAKIOS    ?= $(if $(wildcard ../xnu/apply.sh),..,../workspace)
+ -include tools/kernels.mk
+ -include tools/compiler.mk
+ ifneq ($(strip $(MESA)),)
+-override CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_MESA_CXXFLAGS)
++override CXXFLAGS += $(CHIP_DEFINES) -DHAKIOS_METAL_MESA $(HAKIOS_METAL_MESA_CXXFLAGS)
+ HOSTLIBS  += $(HAKIOS_METAL_MESA_LIBS)
+ HOSTOUT   = out/host-mesa$(if $(SAN),-$(SAN))
+ endif
+@@ -91,8 +91,15 @@ ios: out/ios/libhakios-metal.a $(if $(wildcard $(IR3_CMDLINE_C)),out/ios/hakios-
+ 
+ darwin: ios
+ 
++# CHIP=a630 builds for the Adreno 630 (0x06030001) instead of the Adreno 7c+ Gen 3 (0x06030500). The two differ in
++# has_lpac, instr_cache_size and fibers_per_sp (freedreno_devices.py: a6xx_gen1 against a6xx_gen4), and those size the
++# streams the emitters write, so a build is for one part and refuses the other by name rather than driving it with the
++# wrong numbers. Unset: the A635-family part this tree grew up on.
++CHIP ?=
++CHIP_DEFINES := $(if $(filter a630,$(CHIP)),-DHAKIOS_METAL_CHIP_A630)
++
+ # with MESA=1 the compiler goes to the phone too, against the iOS build of Mesa's libraries (IOS_MESA_BUILD, tools/compiler.mk)
+-IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
++IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror $(CHIP_DEFINES)
+ IOS_LIBS     =
+ ifneq ($(strip $(MESA)),)
+ IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)
+diff --git a/hakios-metal/include/hakios-metal/a6xx.hpp b/hakios-metal/include/hakios-metal/a6xx.hpp
+index b01af4c..eeb70fb 100644
+--- a/hakios-metal/include/hakios-metal/a6xx.hpp
++++ b/hakios-metal/include/hakios-metal/a6xx.hpp
+@@ -1,11 +1,12 @@
+-// The Adreno A6xx registers, packet words and descriptor fields a compute dispatch and one draw write, for the Adreno
+-// 7c+ Gen 3 (the A635 family, chip id 0x06030500: Mesa's "a6xx gen4", the same generation as the A660).
++// The Adreno A6xx registers, packet words and descriptor fields a compute dispatch and one draw write, for the A6xx
++// parts this tree knows: the Adreno 630 (chip id 0x06030001, "a6xx gen1", the OnePlus 6T's GPU) and the Adreno 7c+ Gen 3
++// (the A635 family, chip id 0x06030500: Mesa's "a6xx gen4").
+ //
+ // Every number here is Mesa 25.0.7's (MIT), from the register XML in src/freedreno/registers/adreno/ (a6xx.xml,
+ // adreno_pm4.xml, adreno_common.xml) through the headers Mesa's build generates from it: a6xx.xml.h,
+ // adreno_pm4.xml.h, adreno_common.xml.h. The names are Mesa's, on purpose: tools/check-a6xx.py reads this file and
+ // those headers and checks every constant here by name, so each item below carries the header and line it comes
+-// from. The few values that are not in the headers (facts about this chip from Mesa's freedreno_devices.py, the
++// from. The few values that are not in the headers (facts about a chip from Mesa's freedreno_devices.py, the
+ // alignment attributes that only the XML carries, one ir3 convention) are marked `not-in-headers:` with where they
+ // come from, and the script lists them instead of checking them. A `__SCALE` constant is the right shift Mesa's
+ // encoder applies before placing a field (the field holds the value in bigger units); the script reads it out of the
+@@ -24,9 +25,31 @@
+ namespace hakios::metal::a6xx {
+ 
+ // --- this chip -----------------------------------------------------------------------------------------------------
+-// From Mesa's src/freedreno/common/freedreno_devices.py: the entry for chip_id ...06030500 ("Adreno 7c+ Gen 3", every
+-// speedbin of the A635) is a6xx_base + a6xx_gen4 with num_ccu = 2.
+-
++//
++// Two parts, and the numbers that differ between them. Everything here is a compile-time constant read from
++// freedreno_devices.py, because the emitters size their streams from it -- so a build is for one chip, chosen by
++// HAKIOS_METAL_CHIP, and a binary that meets the other part must refuse it by name rather than send it registers that
++// mean something else.
++//
++//   freedreno_devices.py GPUId(630):  [a6xx_base, a6xx_gen1], num_ccu = 2, fibers_per_sp = 128 * 16
++//   freedreno_devices.py GPUId(...06030500): [a6xx_base, a6xx_gen4], num_ccu = 2, fibers_per_sp = 128 * 2 * 16
++//
++// a6xx_gen1 carries instr_cache_size = 64 and reg_size_vec4 = 96; a6xx_gen4 carries instr_cache_size = 127 and
++// reg_size_vec4 = 64. has_lpac is set by a6xx_gen4 and the generations after it, never by a6xx_gen1: the 630 has no
++// low-priority async compute queue. supports_double_threadsize is true in a6xx_base itself and neither entry
++// overrides it.
++#if defined(HAKIOS_METAL_CHIP_A630)
++inline constexpr uint32_t kChipId = 0x06030001;              // dt qcom,chipid of the OnePlus 6T
++inline constexpr bool kHasLpac = false;                      // not-in-headers: a6xx_gen1 does not set has_lpac
++inline constexpr bool kSupportsDoubleThreadsize = true;      // not-in-headers: freedreno_devices.py a6xx_base default
++inline constexpr uint32_t kInstrCacheSize = 64;              // not-in-headers: freedreno_devices.py a6xx_gen1.instr_cache_size
++inline constexpr uint32_t kFibersPerSp = 128 * 16;           // not-in-headers: freedreno_devices.py GPUId(630).fibers_per_sp
++inline constexpr uint32_t kNumSpCores = 2;                   // not-in-headers: freedreno_devices.py num_sp_cores = num_ccu
++inline constexpr uint32_t kCsSharedMemSize = 32 * 1024;      // not-in-headers: freedreno_devices.py GPUId(630).cs_shared_mem_size
++inline constexpr uint32_t kThreadsizeBase = 64;              // not-in-headers: freedreno_devices.py A6xxGPUInfo default threadsize_base
++inline constexpr uint32_t kMaxWaves = 16;                    // not-in-headers: freedreno_devices.py A6xxGPUInfo default max_waves
++inline constexpr uint32_t kWaveGranularity = 2;              // not-in-headers: freedreno_devices.py GPUId(630).wave_granularity
++#else
+ inline constexpr uint32_t kChipId = 0x06030500;             // not-in-headers: freedreno_devices.py GPUId(chip_id=0x..06030500)
+ inline constexpr bool kHasLpac = true;                       // not-in-headers: freedreno_devices.py a6xx_gen4.has_lpac
+ inline constexpr bool kSupportsDoubleThreadsize = true;      // not-in-headers: freedreno_devices.py a6xx_base.supports_double_threadsize
+@@ -39,6 +62,8 @@ inline constexpr uint32_t kCsSharedMemSize = 32 * 1024;      // not-in-headers:
+ inline constexpr uint32_t kThreadsizeBase = 64;              // not-in-headers: freedreno_devices.py A6xxGPUInfo default threadsize_base
+ inline constexpr uint32_t kMaxWaves = 16;                    // not-in-headers: freedreno_devices.py A6xxGPUInfo default max_waves
+ inline constexpr uint32_t kWaveGranularity = 2;              // not-in-headers: freedreno_devices.py, the A635 entry (wave_granularity)
++#endif
++
+ // ir3's "no register": regid(63, 0) = 63 << 2 | 0. The *CONSTID / *REGID fields take it for a value the shader does
+ // not read (the work group size and offset constants, the linear local id), and it is what Mesa writes there.
+ inline constexpr uint32_t kRegidNone = 0xfc;                 // not-in-headers: ir3/instr-a3xx.h INVALID_REG = regid(63, 0)
+diff --git a/hakios-metal/tests/a6xx_test.cpp b/hakios-metal/tests/a6xx_test.cpp
+index d46ceaa..6ebc1db 100644
+--- a/hakios-metal/tests/a6xx_test.cpp
++++ b/hakios-metal/tests/a6xx_test.cpp
+@@ -109,9 +109,12 @@ TEST(a6xx_load_state6_word_0) {
+     CHECK_EQ(loadState6_0(4, ST6_CONSTANTS, SS6_DIRECT, SB6_CS_SHADER, 3), 0x00f44004u);
+     // one IBO descriptor: ST6_IBO (3) << 14 = 0xc000 | 0x20000 | 0x340000 | 1 << 22 = 0x400000
+     CHECK_EQ(loadState6_0(0, ST6_IBO, SS6_INDIRECT, SB6_CS_SHADER, 1), 0x0076c000u);
+-    // the shader preload is capped at the instruction cache, and that fits the 10-bit NUM_UNIT
+-    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
+-    CHECK_EQ(kInstrCacheSize, 127u);
++    // the shader preload is capped at the instruction cache, and that fits the 10-bit NUM_UNIT.
++    // The cap itself is per chip (a6xx_gen1: 64, a6xx_gen4: 127), so the encoder is checked against
++    // whatever kInstrCacheSize this build carries, and the field is checked to hold it.
++    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), (kInstrCacheSize & 0x3ffu) << 22);
++    CHECK(kInstrCacheSize == 64u || kInstrCacheSize == 127u);
++    CHECK(kInstrCacheSize <= 0x3ffu);
+     // the source address: the low word keeps bits 31:2, the high word is whole
+     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1000), 0x1000u);
+     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1003), 0x1000u);
+@@ -282,10 +285,15 @@ TEST(a6xx_private_memory_fields_are_scaled) {
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x3ffff000), 0x3ffffu);
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x800), 1u);
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x10000), 0x20u);
+-    // this chip: 4096 fibers per SP, 2 SPs; a 512-byte private memory per fiber is 2 MiB per SP, 4 MiB in all
+-    CHECK_EQ(kFibersPerSp, 4096u);
++    // this chip: kFibersPerSp fibers per SP (a6xx_gen1: 2048, a6xx_gen4: 4096), 2 SPs. The private
++    // memory field is checked against the fiber count this build carries rather than a literal.
++    CHECK(kFibersPerSp == 128u * 16u || kFibersPerSp == 128u * 2u * 16u);
+     CHECK_EQ(kNumSpCores, 2u);
+-    CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 512u);
++    // 512 bytes per fiber, in 4 KiB units, capped at the field's 9 bits
++    {
++        const uint32_t per_sp_kb = (512u * kFibersPerSp) >> 10;
++        CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512u * kFibersPerSp), per_sp_kb >> 2);
++    }
+ }
+ 
+ TEST(a6xx_dispatch_words) {
+@@ -744,7 +752,7 @@ TEST(a6xx_first_draw_program_words) {
+     CHECK_EQ(hlsqFsCntl0(THREAD128, true), 0x3u);
+     CHECK_EQ(hlsqFsCntl0(THREAD64, false), 0u);
+     // the stage loads: NUM_UNIT is capped at the instruction cache, as compute's is
+-    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
++    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), (kInstrCacheSize & 0x3ffu) << 22);
+     // the private memory words are the compute ones' twins (same scales)
+     CHECK_EQ(A6XX_SP_VS_PVT_MEM_PARAM_MEMSIZEPERITEM(512), 1u);
+     CHECK_EQ(A6XX_SP_FS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x1000), 1u);
+diff --git a/hakios-metal/tests/compute_test.cpp b/hakios-metal/tests/compute_test.cpp
+index c7f9c6f..dbca094 100644
+--- a/hakios-metal/tests/compute_test.cpp
++++ b/hakios-metal/tests/compute_test.cpp
+@@ -1185,12 +1185,19 @@ TEST(a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround) {
+         CHECK(cb->status() == CommandBuffer::kCompleted);
+     }
+     {
++        // chain160's own instrlen is 96 units (fixtures/chain160_air.hpp), not its name. Whether that
++        // exceeds the instruction cache is per chip -- a6xx_gen1 caps at 64, a6xx_gen4 at 127 -- so the
++        // workaround is checked against this build's cap: under it on the 635, over it on the 630.
++        const bool chainOverCap = kernels::chain160_air.instrlen > a6xx::kInstrCacheSize;
++
+         Encoded e(r, kernels::chain160_air, kGroups16, local, b);
+         CHECK(e.ok);
+-        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
++        CHECK_EQ(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) != size_t(-1), chainOverCap);
+         size_t before = 0, after = 0;
+         labels(e, &before, &after);
+-        CHECK_EQ(before + after, size_t(0));
++        // the workaround brackets the draw with a before/after pair; the exact count depends on
++        // the instruction-cache workaround the chip needs, so only its absence is asserted here
++        CHECK_EQ(before + after == 0, !chainOverCap);
+         // the same kernel with its preload cut below its length is fetched past the preload, and gets it
+         compute::Options cut;
+         cut.preloadCap = 64;
+diff --git a/hakios-metal/tests/render_test.cpp b/hakios-metal/tests/render_test.cpp
+index 1bfcf52..a56e965 100644
+--- a/hakios-metal/tests/render_test.cpp
++++ b/hakios-metal/tests/render_test.cpp
+@@ -4648,7 +4648,9 @@ TEST(a_program_longer_than_the_instruction_cache_is_preloaded_in_part) {
+         const uint32_t type = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
+         const uint32_t block = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT;
+         if (type == a6xx::ST6_SHADER && block == a6xx::SB6_FS_SHADER) {
+-            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, 127u);
++            // the preload is capped at this build's instruction cache (a6xx_gen1: 64, a6xx_gen4: 127)
++            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT,
++                     uint32_t(a6xx::kInstrCacheSize));
+             w[i + 1] = (d0 & ~a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) | a6xx::CP_LOAD_STATE6_0_NUM_UNIT(128);
+             found = true;
+         }

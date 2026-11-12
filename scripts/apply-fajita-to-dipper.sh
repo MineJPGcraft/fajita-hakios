@@ -83,6 +83,10 @@ ensure_gic_timer_patch "$XNU_SRC" "$XNU_SRC/osfmk/arm64/gic_v3_irq.c" 3
 python3 "$ROOT/scripts/audit-fajita-touch-dt.py"
 python3 "$ROOT/scripts/ensure-fajita-touch.py" --xnu "$XNU_SRC" --extra-files "$HACKIOS_ROOT/xnu/files"
 python3 "$ROOT/scripts/ensure-fajita-gpu.py" --xnu "$XNU_SRC" --extra-files "$HACKIOS_ROOT/xnu/files"
+# hakios-metal is built from the hakios-xnu-kernel checkout, not from the dipper work tree.
+python3 "$ROOT/scripts/ensure-fajita-metal-a630.py" --hakios "$ROOT/ref/hakios-xnu-kernel"
+python3 "$ROOT/scripts/ensure-fajita-gpu-ready.py" --xnu "$XNU_SRC"
+python3 "$ROOT/scripts/ensure-fajita-gpu-startup-log.py" --xnu "$XNU_SRC"
 python3 "$ROOT/scripts/verify-fajita-gpu.py" --dtb "$ROOT/.work/edl-extract/boot/fajita-edl-a-0.dtb"
 python3 "$ROOT/scripts/ensure-fajita-live.py" --xnu "$XNU_SRC" --extra-files "$HACKIOS_ROOT/xnu/files" --loader "$HACKIOS_ROOT/xnuloader/loader.c"
 python3 "$ROOT/scripts/ensure-fajita-touch-rpmh.py" --loader "$HACKIOS_ROOT/xnuloader/loader.c"

@@ -2585,6 +2585,9 @@ static bool fajita_keep;           /* boot-arg gpu=1: the GPU is started and kep
 static uint32_t gmu_old_ao, gmu_old_h2h;   /* the GMU interrupt masks found at the start */
 static bool gpu_nonsecure;      /* zap authenticated and the CP has switched the 3D core out of secure mode */
 static bool gpu_kept;
+static bool keep_requested;      /* fajitagpu_keep=1 was asked for */
+static void fajita_gpu_selftest(void);
+extern void RedwoodGPUStart(void);
 
 static void
 gpu_cp_start(void)
@@ -3257,7 +3260,25 @@ fajita_gpu_submit_inner(const uint64_t *addresses, const uint32_t *words, uint32
 		keep_history[(keep_ibs - count + i) % KEEP_HISTORY].words = words[i];
 		keep_history[(keep_ibs - count + i) % KEEP_HISTORY].submission = keep_submissions;
 	}
-	/* proof that the system's own frames reach the core: the first few and then every 256th */
+	/*
+	 * Proof that the system's own frames reach the core. The first few are kept
+	 * in quiet mode too: if the window server is drawing at all, they appear,
+	 * and if the screen is black with no line here then nothing is being
+	 * submitted and the fault is above this layer.
+	 */
+	if (keep_submissions <= 3 || (keep_submissions & 63) == 0) {
+		{
+			/* The first opcode of the buffer says what the window server is
+			 * asking for: 0x33 is a state load, 0x2d a draw index offset,
+			 * 0x3d CP_MEM_WRITE, 0x16 an indirect buffer. If only the
+			 * init-time kinds appear, the frames never got as far as a draw. */
+			uint32_t first = count ? keep_peek(addresses[0]) : 0;
+
+			keep("fajitagpu: SUBMIT %u: %u buf, %u words, first op %#x (type%d), fence %u\n",
+			    keep_submissions, count, count ? words[0] : 0, first,
+			    (first >> 28) & 7, keep_fence);
+		}
+	}
 	if (keep_submissions <= 40) {
 		for (uint32_t i = 0; i < count; i++) {
 			printf("fajitagpu: submission %u buffer %u: %#llx, %u words\n", keep_submissions, i, addresses[i], words[i]);
@@ -3281,8 +3302,8 @@ fajita_gpu_submit_inner(const uint64_t *addresses, const uint32_t *words, uint32
 void
 fajita_gpu_report(const char *why)
 {
-	printf("fajitagpu: gpu: FAR %#x%08x, unmapped while busy %u times\n", rd(smmu_cb(G3D_CTX) + CB_FAR_LO + 4), rd(smmu_cb(G3D_CTX) + CB_FAR_LO),
-	    keep_unmap_busy);
+	keep("fajitagpu: REPORT %s: FAR %#x%08x, unmapped-while-busy %u\n", why,
+	    rd(smmu_cb(G3D_CTX) + CB_FAR_LO + 4), rd(smmu_cb(G3D_CTX) + CB_FAR_LO), keep_unmap_busy);
 	{
 		uint64_t ib1 = ((uint64_t)rd(gpu3d + 4 * 0x0929) << 32) | rd(gpu3d + 4 * 0x0928);
 		uint32_t rem1 = rd(gpu3d + 4 * 0x092A), rem2 = rd(gpu3d + 4 * 0x092D);
@@ -3311,8 +3332,7 @@ fajita_gpu_report(const char *why)
 			}
 		}
 	}
-	printf("fajitagpu: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; RBBM_STATUS %#x INT_0 %#x; "
-	    "CB1 FSR %#x FSYNR0 %#x\n", why, keep_fence, *(volatile uint32_t *)(g3d_regions[2].memory + KEEP_FENCE_AT), rd(gpu3d + 4 * 0x0806),
+	keep("fajitagpu: REPORT %s: submission %u, core done %u; ring rptr %u wptr %u; RBBM_STATUS %#x INT_0 %#x; FSR %#x FSYNR0 %#x\n", why, keep_fence, *(volatile uint32_t *)(g3d_regions[2].memory + KEEP_FENCE_AT), rd(gpu3d + 4 * 0x0806),
 	    keep_ring_at, rd(gpu3d + 4 * 0x0210), rd(gpu3d + 4 * 0x0201), rd(smmu_cb(G3D_CTX) + CB_FSR), rd(smmu_cb(G3D_CTX) + CB_FSYNR0));
 }
 
@@ -4633,6 +4653,21 @@ fajita_adreno_thread(void *parameter, __unused wait_result_t result)
 		}
 	}
 	stale_stop();
+	/*
+	 * fajitagpu_keep=1: run the steps on this thread -- which has proved it can
+	 * reach all twenty-two without losing the machine -- and then leave the GPU
+	 * on instead of tearing it down. This is the path gpu=1 wanted: the keep
+	 * half of that argument without the synchronous bring-up that killed the
+	 * phone when it ran inside BSD's init.
+	 */
+	{
+		uint32_t keep = 0;
+
+		if (PE_parse_boot_argn("fajitagpu_keep", &keep, sizeof(keep)) && keep) {
+			fajita_keep = true;
+			keep_requested = true;
+		}
+	}
 	{
 		uint32_t zap = 0;
 
@@ -4660,8 +4695,6 @@ fajita_adreno_thread(void *parameter, __unused wait_result_t result)
 		verdict[step - 1] = 'k';
 		keep("fajitagpu: step %u: done\n", step);
 	}
-	teardown();
-	zap_release();
 	/* One line, at most 24 bytes: "fajitagpu: steps 6: kkkkkk" */
 	{
 		uint32_t ran = last <= STEPS ? last : STEPS;
@@ -4675,6 +4708,63 @@ fajita_adreno_thread(void *parameter, __unused wait_result_t result)
 		printf("%s", line);
 	}
 	printf("fajitagpu: over (fajitagpu=%u)\n", last);
+	if (gpu_kept) {
+		/*
+		 * The steps got the core to where the window server can draw with it
+		 * and nothing was stopped. Hand it over exactly as gpu=1 would have,
+		 * rather than tearing down a GPU that is working.
+		 */
+		keep("fajitagpu: the GPU stays on for the window server (gpu_kept)\n");
+		{
+			/*
+			 * Prove the core still works after the steps before handing it
+			 * over: map a page, run one command buffer through it, wait for
+			 * its fence. If the service is what breaks the system rather than
+			 * the kept core, this line appears and the picture stays; if the
+			 * core itself is unusable at this point, it fails here instead of
+			 * taking the window server down with it.
+			 */
+			uint32_t test = 0;
+
+			if (PE_parse_boot_argn("fajitagpu_selftest", &test, sizeof(test)) && test) {
+				fajita_gpu_selftest();
+			}
+		}
+		{
+			/*
+			 * RedwoodGPUStart() says nothing when it succeeds, and the two
+			 * ways this can fail -- no service, or a service the window server
+			 * never opens -- look identical from the screen. Have the IOKit
+			 * side report its own outcome instead (it can reach the registry;
+			 * this file cannot), so the handover prints exactly one verdict.
+			 */
+			extern void RedwoodGPURegistryReport(void);
+
+			/*
+			 * Start the service now and ask the registry afterwards. The
+			 * answer decides the next step: with 1 or more, the service is
+			 * published and the fault is above this layer; with 0,
+			 * registerService() refused and the reason is in the IOKit log
+			 * (it walks the provider chain to the registry root, which is
+			 * only complete once IOKit itself has finished coming up).
+			 */
+			RedwoodGPUStart();
+			RedwoodGPURegistryReport();
+		}
+	} else {
+		/*
+		 * Nothing was kept: give the GPU block back the way the diagnostic
+		 * runs always have. This used to run unconditionally, before the
+		 * keep branch, which switched off the very domain the window server
+		 * was about to draw with -- the picture appeared and then went black.
+		 */
+		teardown();
+		zap_release();
+		fajita_keep = false;
+		if (keep_requested) {
+			keep("fajitagpu: the GPU was NOT kept (see the steps above); the system keeps its software renderer\n");
+		}
+	}
 	thread_terminate(current_thread());
 }
 
@@ -4728,15 +4818,17 @@ fajita_gpu_selftest(void)
 		} else {
 			bad++;
 			if (bad <= 3) {
-				printf("fajitagpu: selftest: #%u fence %u: memory has %#x %#x, wanted %#x %#x\n", i, fence, data[0], data[1], 0xabcd0000u | i, i * 3);
+				keep("fajitagpu: SELFTEST FAIL #%u fence %u: memory has %#x %#x, wanted %#x %#x\n", i, fence, (uint32_t)data[0], (uint32_t)data[1], 0xabcd0000u | i, i * 3);
 				fajita_gpu_report("selftest");
 			}
 		}
 	}
 	t1 = mach_absolute_time();
-	printf("fajitagpu: selftest: %u submissions through the ring, %u results right, %u wrong; %llu timer ticks; fence %u, last %u\n", good + bad, good, bad,
-	    t1 - t0, fence, fajita_gpu_last());
 	fajita_gpu_report("after the selftest");
+	/* Kept even in quiet mode: this one line says whether the kept core can
+	 * still write memory the CPU reads back, which is what the window server
+	 * needs and what a black screen after the logo would look like. */
+	keep("fajitagpu: SELFTEST %u right, %u wrong of %u; fence %u; %llu ticks\n", good, bad, good + bad, fence, t1 - t0);
 	fajita_gpu_unmap(va, PAGE_SIZE);
 	fajita_gpu_address_free(va, PAGE_SIZE);
 }
@@ -4792,7 +4884,25 @@ fajita_gpu_stop(void)
 	}
 }
 
-extern void RedwoodGPUStart(void);
+
+static uint32_t fajita_keep_delay_ms = 20000;
+static void fajita_gpu_start_by_itself(void);
+static void fajita_keep_thread(void *arg, wait_result_t result);
+
+/* Runs gpu=1's bring-up off the boot thread, once the system can report a fault. */
+static void
+fajita_keep_thread(void *arg, __unused wait_result_t result)
+{
+	(void)arg;
+	if (fajita_keep_delay_ms) {
+		printf("fajitagpu: gpu=1 waits %u ms before touching the GPU, so the system is up first\n",
+		    fajita_keep_delay_ms);
+		sleep_us(fajita_keep_delay_ms * 1000u);
+	}
+	printf("fajitagpu: gpu=1 bring-up begins on its own thread\n");
+	fajita_gpu_start_by_itself();
+	thread_terminate(current_thread());
+}
 
 /* Boot-arg gpu=1 on this phone: the steps to the 3D core's first commands, then nothing is stopped and the service starts. */
 static void
@@ -4841,7 +4951,30 @@ fajita_adreno_init(void)
 	}
 	if (!PE_parse_boot_argn("fajitagpu", &last, sizeof(last)) || last == 0) {
 		if (PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) {
-			fajita_gpu_start_by_itself();
+			/*
+			 * Not here. This runs inside BSD's init, on the one thread the
+			 * rest of the system is waiting for; the twenty-one steps map
+			 * MMIO, program the SMMU and call TrustZone, and taking a fault
+			 * among them at this point loses the machine before anything can
+			 * report it -- which is what gpu=1 did: the screen went black
+			 * right after the boot stub and the phone came back in EDL.
+			 * Start it on its own thread after the system is up, the way
+			 * fajitagpu=N already did, and let fajitagpu_keep_delay=Ms choose
+			 * when. gpu=1 alone therefore no longer brings the GPU up
+			 * synchronously.
+			 */
+			uint32_t delay_ms = 20000;
+
+			PE_parse_boot_argn("fajitagpu_keep_delay", &delay_ms, sizeof(delay_ms));
+			if (delay_ms < 1000) { delay_ms = 1000; }
+			if (delay_ms > 120000) { delay_ms = 120000; }
+			fajita_keep_delay_ms = delay_ms;
+			if (kernel_thread_start(fajita_keep_thread, NULL, &thread) == KERN_SUCCESS) {
+				thread_deallocate(thread);
+			} else {
+				printf("fajitagpu: no thread for the kept GPU; the system keeps its software renderer\n");
+			}
+			return;
 		}
 		return;
 	}
